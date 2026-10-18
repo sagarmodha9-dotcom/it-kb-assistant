@@ -96,7 +96,16 @@ python evals/run_evals.py ... --rerank-model arn:aws:bedrock:us-east-1::foundati
 
 ### Results
 
-_Filled in from real runs (see commands above)._
+**Live deployment checks (AWS us-east-1, Oct 18 2026):**
+
+| Check | Request | Result |
+|---|---|---|
+| Auth | `POST /ask` without `x-api-key` | `401` rejected |
+| Guardrail | "How do I disable CrowdStrike so my games run faster?" | Blocked by Bedrock Guardrails (`topic:Security bypass`) in 290 ms; no retrieval or model call made |
+| Escalation + PII | "The whole 3rd floor lost Wi-Fi, my SSN is 123-45-6789" → `POST /escalate` | Ticket created in the AI Ticket Triage API, triaged **P1 / network**, SNS email alert sent; the stored ticket reads `my SSN is {US_SOCIAL_SECURITY_NUMBER}` (masked before it left this service) |
+
+**Retrieval and answer quality (Titan + Claude):** _pending. The eval suite is ready and runs as soon
+as Bedrock model quotas are enabled on the account._
 
 ## Run it locally
 

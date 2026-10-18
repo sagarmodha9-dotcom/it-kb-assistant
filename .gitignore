@@ -7,3 +7,7 @@ evals/results/
 .env
 samconfig.toml
 .DS_Store
+
+# Streamlit agent skills (local symlinks)
+.agents/
+.claude/
