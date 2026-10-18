@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: python scripts/build_index.py --embedder hash
+      - run: python -m pytest -q
+      - name: Evals (offline)
+        # Hash embeddings only match shared words and the fake model is a word-overlap stub, so these
+        # floors catch pipeline regressions; real quality numbers come from Titan + Claude runs.
+        run: python evals/run_evals.py --compare-keyword --min-pass-rate 0.4 --min-hit3 0.8
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the image
+        run: docker build -t it-kb-assistant .
+      - name: Smoke test the running container
+        run: |
+          docker run -d --name app -p 8501:8501 it-kb-assistant
+          for i in $(seq 1 30); do curl -sf localhost:8501/_stcore/health && break; sleep 1; done
+          curl -sf localhost:8501/_stcore/health
+      - name: Container logs
+        if: always()
+        run: docker logs app || true

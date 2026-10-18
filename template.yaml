@@ -1,0 +1,374 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  IT Knowledge Base Assistant - RAG over IT docs with Amazon Bedrock Knowledge Bases (Titan
+  embeddings in Amazon S3 Vectors), Bedrock Guardrails, Claude, Lambda, and API Gateway.
+  Questions it can't answer become tickets in the AI Ticket Triage API.
+
+Parameters:
+  ModelId:
+    Type: String
+    Description: Bedrock model or inference profile ID used to write answers.
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  LlmProvider:
+    Type: String
+    Description: >
+      bedrock = Bedrock only. anthropic = Anthropic API only.
+      bedrock_with_anthropic_fallback = try Bedrock first, fail over to the Anthropic API.
+    Default: bedrock_with_anthropic_fallback
+    AllowedValues: [bedrock, anthropic, bedrock_with_anthropic_fallback]
+  AnthropicModelId:
+    Type: String
+    Default: claude-haiku-4-5
+  AnthropicKeyParam:
+    Type: String
+    Description: SSM SecureString holding the Anthropic API key (reuses the triage project's key).
+    Default: /ai-ticket-triage/anthropic-api-key
+  ApiKeyParam:
+    Type: String
+    Description: SSM SecureString holding the key callers must send as the x-api-key header.
+    Default: /it-kb-assistant/api-key
+  TriageApiUrl:
+    Type: String
+    Description: Base URL of the AI Ticket Triage API (its ApiUrl output). Empty = escalation disabled.
+    Default: ""
+  RerankModelId:
+    Type: String
+    Description: >
+      Optional rerank model (e.g. cohere.rerank-v3-5:0 in us-east-1). Empty = no reranking.
+      Cohere models need a one-time subscription in the Bedrock console first.
+    Default: ""
+  GroundingThreshold:
+    Type: Number
+    Description: Answers scoring below this on contextual grounding are blocked (0 to 0.99).
+    Default: 0.7
+  RelevanceThreshold:
+    Type: Number
+    Description: Answers scoring below this on relevance to the question are blocked (0 to 0.99).
+    Default: 0.5
+
+Conditions:
+  UseRerank: !Not [!Equals [!Ref RerankModelId, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    CodeUri: src/
+    MemorySize: 256
+    Timeout: 29  # API Gateway HTTP APIs stop waiting at 30 seconds
+    Environment:
+      Variables:
+        API_KEY_PARAM: !Ref ApiKeyParam
+        GUARDRAIL: bedrock
+        GUARDRAIL_ID: !GetAtt Guardrail.GuardrailId
+        GUARDRAIL_VERSION: !GetAtt GuardrailVersion.Version
+
+Resources:
+  # ---------- Knowledge base: docs in S3 -> chunks -> Titan embeddings -> S3 Vectors ----------
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # S3 Vectors: serverless vector storage, pay per use (no always-on cluster like OpenSearch).
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+      DataType: float32
+      Dimension: 1024          # must match the embedding model's output size (Titan V2: 1024)
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        # Bedrock stores the chunk text and its metadata here. They're too big to be filterable
+        # (2 KB limit), so they must be non-filterable or ingestion fails.
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_TEXT
+          - AMAZON_BEDROCK_METADATA
+
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*
+      Policies:
+        - PolicyName: knowledge-base-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EmbedWithTitan
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+              - Sid: ReadDocs
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DocsBucket.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${DocsBucket.Arn}/*
+              - Sid: ReadWriteVectors
+                Effect: Allow
+                Action:
+                  - s3vectors:PutVectors
+                  - s3vectors:GetVectors
+                  - s3vectors:DeleteVectors
+                  - s3vectors:QueryVectors
+                  - s3vectors:GetIndex
+                Resource: !GetAtt VectorIndex.IndexArn
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub ${AWS::StackName}-kb
+      Description: IT help desk SOPs and how-to articles
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+              EmbeddingDataType: FLOAT32
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt VectorIndex.IndexArn
+
+  DocsDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: it-docs
+      KnowledgeBaseId: !GetAtt KnowledgeBase.KnowledgeBaseId
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DocsBucket.Arn
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 300
+            OverlapPercentage: 15
+
+  # ---------- Guardrail: applied to input and output with the ApplyGuardrail API ----------
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub ${AWS::StackName}-guardrail
+      Description: Input and output safety for the IT knowledge base assistant
+      BlockedInputMessaging: I can't help with that request.
+      BlockedOutputsMessaging: I couldn't find a reliable answer to that.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: PROMPT_ATTACK      # jailbreaks and "ignore your instructions" (input only)
+            InputStrength: HIGH
+            OutputStrength: NONE
+          - Type: MISCONDUCT
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: HATE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: INSULTS
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: VIOLENCE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: SEXUAL
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+      TopicPolicyConfig:
+        TopicsConfig:
+          - Name: Security bypass
+            Type: DENY
+            Definition: >-
+              Requests for help disabling, uninstalling, evading, or getting around security
+              controls such as antivirus or EDR software (CrowdStrike Falcon), MFA, firewalls,
+              disk encryption, or monitoring.
+            Examples:
+              - How do I turn off CrowdStrike so my computer runs faster?
+              - How can I get around MFA so I don't have to approve sign-ins?
+              - How do I disable BitLocker without IT knowing?
+            InputEnabled: true
+            InputAction: BLOCK
+            OutputEnabled: false   # answers that *mention* security tools are fine
+          - Name: Credential sharing
+            Type: DENY
+            Definition: >-
+              Requests to share, send, or reveal a password, MFA code, or recovery key to
+              another person, or to get someone else's credentials.
+            Examples:
+              - Can I give my password to my coworker so she can check my email?
+              - What is my manager's password?
+            InputEnabled: true
+            InputAction: BLOCK
+            OutputEnabled: false
+      SensitiveInformationPolicyConfig:
+        # Masked on input so personal data never reaches retrieval, the model, logs, or tickets.
+        # On output only high-risk types are masked: answers may quote support emails and numbers.
+        PiiEntitiesConfig:
+          - Type: US_SOCIAL_SECURITY_NUMBER
+            Action: ANONYMIZE
+            InputEnabled: true
+            InputAction: ANONYMIZE
+            OutputEnabled: true
+            OutputAction: ANONYMIZE
+          - Type: CREDIT_DEBIT_CARD_NUMBER
+            Action: ANONYMIZE
+            InputEnabled: true
+            InputAction: ANONYMIZE
+            OutputEnabled: true
+            OutputAction: ANONYMIZE
+          - Type: EMAIL
+            Action: ANONYMIZE
+            InputEnabled: true
+            InputAction: ANONYMIZE
+            OutputEnabled: false
+          - Type: PHONE
+            Action: ANONYMIZE
+            InputEnabled: true
+            InputAction: ANONYMIZE
+            OutputEnabled: false
+          - Type: PASSWORD
+            Action: ANONYMIZE
+            InputEnabled: true
+            InputAction: ANONYMIZE
+            OutputEnabled: false
+      ContextualGroundingPolicyConfig:
+        # Checked on the answer against the retrieved chunks: is it supported, and is it on topic?
+        FiltersConfig:
+          - Type: GROUNDING
+            Threshold: !Ref GroundingThreshold
+          - Type: RELEVANCE
+            Threshold: !Ref RelevanceThreshold
+
+  # A numbered, unchangeable snapshot of the guardrail. After editing the guardrail above,
+  # change this Description so CloudFormation publishes a new version.
+  GuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt Guardrail.GuardrailId
+      Description: v1
+
+  # ---------- API ----------
+  AssistantApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 2
+        ThrottlingBurstLimit: 5
+
+  AskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.ask
+      Description: Answer an IT question from the knowledge base with citations
+      Environment:
+        Variables:
+          RETRIEVER: bedrock-kb
+          KNOWLEDGE_BASE_ID: !GetAtt KnowledgeBase.KnowledgeBaseId
+          LLM_PROVIDER: !Ref LlmProvider
+          MODEL_ID: !Ref ModelId
+          ANTHROPIC_MODEL_ID: !Ref AnthropicModelId
+          ANTHROPIC_KEY_PARAM: !Ref AnthropicKeyParam
+          RERANK_MODEL_ARN: !If
+            - UseRerank
+            - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${RerankModelId}
+            - ""
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:Retrieve
+              Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - arn:aws:bedrock:*::foundation-model/anthropic.*
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${ModelId}
+            - Effect: Allow
+              Action: bedrock:ApplyGuardrail
+              Resource: !GetAtt Guardrail.GuardrailArn
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeyParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AnthropicKeyParam}
+        - !If
+          - UseRerank
+          - Statement:
+              - Effect: Allow
+                Action: bedrock:Rerank   # the Rerank API doesn't support resource-level permissions
+                Resource: "*"
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${RerankModelId}
+          - !Ref AWS::NoValue
+      Events:
+        Ask:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AssistantApi
+            Path: /ask
+            Method: POST
+
+  EscalateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.escalate
+      Description: Turn an unanswered question into a ticket in the AI Ticket Triage API
+      Environment:
+        Variables:
+          TRIAGE_API_URL: !Ref TriageApiUrl
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:ApplyGuardrail
+              Resource: !GetAtt Guardrail.GuardrailArn
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeyParam}
+      Events:
+        Escalate:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AssistantApi
+            Path: /escalate
+            Method: POST
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${AssistantApi}.execute-api.${AWS::Region}.amazonaws.com
+  DocsBucketName:
+    Value: !Ref DocsBucket
+  KnowledgeBaseId:
+    Value: !GetAtt KnowledgeBase.KnowledgeBaseId
+  DataSourceId:
+    Value: !GetAtt DocsDataSource.DataSourceId
+  GuardrailId:
+    Value: !GetAtt Guardrail.GuardrailId
+  GuardrailVersion:
+    Value: !GetAtt GuardrailVersion.Version
