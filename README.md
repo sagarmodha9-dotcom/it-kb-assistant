@@ -184,6 +184,101 @@ from the golden set (`scripts/servicenow_eval.py`), each scored on the AI work n
    runs it right after the save (the webhook answers in under a second; 5-second cap).
 6. Role assignment and journal reads are slow on a new instance; setup and eval wait longer.
 
+## Enterprise IT agent (12 workflows)
+
+With `ServiceNowEnterprise=true` (the default) the ticket agent also gets IT tools for 12 common
+service-desk workflows. It diagnoses, takes approved actions, and verifies them, and it asks the caller
+to confirm before anything is resolved. Everything runs through one framework (`src/enterprise/`),
+so every workflow gets the same authorization, approval, audit, and failure handling.
+
+**Real vs simulated.** ServiceNow, the knowledge base (RAG + Bedrock Guardrails), and Claude are real.
+Microsoft Entra ID, Intune, Microsoft 365, Exchange Online, monitoring, device logs, and HR are
+**simulated backends** (`src/enterprise/sim.py`, a fictional company). They behave like the real services
+where it matters to the agent: lockouts, MFA push results, license seats, group owners, device
+compliance, throttling, and timeouts. Connecting a real tenant means replacing one backend class.
+Nothing in this project changes a real account, device, or license.
+
+| # | Workflow | Integration | What the agent does | Gates | Tests |
+|---|---|---|---|---|---|
+| 1 | Password reset and account unlock | Simulated Entra ID | Account status, MFA-verified unlock or reset; unique random temporary password sent to the registered phone, change required at next sign-in | Identity, own account only | 5 |
+| 2 | Intune device diagnostics | Simulated Intune | Compliance, last check-in, BitLocker, OS, disk; Intune sync | Own devices only | 2 |
+| 3 | Microsoft 365 license management | Simulated M365 | Assigned licenses and seat inventory; assign a license | Identity, manager approval, seat check | 2 |
+| 4 | Group membership and access | Simulated Entra ID | Finds the group behind a site/channel and its owner; adds the caller | Identity, group owner approval | 1 |
+| 5 | VPN troubleshooting | KB **real**, monitoring simulated | Service health, VPN client version, cited KB fix, or escalation to Network | - | 2 |
+| 6 | Software installation | Simulated Intune + catalog | Catalog policy (auto-approved, needs approval, prohibited), disk check, deployment | Identity, manager approval when required | 1 |
+| 7 | Incident triage and assignment | **Real** ServiceNow | Team, priority (only up, max 2), handoff note | Fixed team list | 1 (+ agent tests) |
+| 8 | Outage detection and coordination | **Real** ServiceNow, monitoring simulated | 3+ similar incidents in 60 min: links to the parent incident, priority 2, no self-service | Link only to a related incident | 1 (+ agent tests) |
+| 9 | Log analysis and root cause | Analysis **real**, logs simulated | Groups recurring events, correlates chains (failed sign-ins -> lockout, disk errors -> corruption), root cause | Own devices only | 1 |
+| 10 | Outlook and Microsoft 365 diagnostics | Simulated Exchange Online | Quota, archive, OST size, external forwarding (flagged for Security), message trace | Own mailbox only | 1 |
+| 11 | Onboarding and offboarding | Simulated Entra ID / M365 / HR | Role-template checklist (account, groups, licenses, software, device), offboarding (disable, revoke, remove, free seats); resumes after a failed step | Manager requests, HR approval, identity | 2 |
+| 12 | Follow-up and resolution verification | **Real** ServiceNow | Caller confirms -> Resolved; anything else -> technician; approvals run the approved action and ask again | Caller only, once | 2 (+ agent tests) |
+
+Tests: `tests/test_enterprise.py` (42) and `tests/test_agent.py` (26), 163 in the suite. They cover
+success, permission denials, identity and approval gates, retries after throttling, timeouts (reads
+retried; writes never blindly repeated), duplicate requests (SQS redelivery), resumable lifecycle
+runs, escalation, and demo isolation. Not yet run live against ServiceNow: see "Outstanding" below.
+
+```mermaid
+flowchart LR
+    subgraph SN[ServiceNow - real]
+      I[Incident] --> BR[Business Rules<br/>new / caller reply / approval]
+    end
+    BR -->|HMAC-signed event| WH[Lambda webhook<br/>verify + de-duplicate]
+    WH --> Q[SQS + DLQ] --> W[Lambda worker]
+    W --> AG[Ticket agent<br/>Claude tool use]
+    AG --> KB[KB assistant<br/>RAG + Bedrock Guardrails]
+    AG --> TK[Toolkit]
+    subgraph FW[src/enterprise framework]
+      TK --> RG[Registry<br/>allowlisted tools]
+      RG --> PL[Policy<br/>identity, scope, approval]
+      PL --> AP[Approvals<br/>bound to exact action]
+      PL --> EX[Executor<br/>idempotency, retries, timeouts]
+      EX --> AU[Audit trail<br/>secrets redacted]
+    end
+    EX --> SIM[Simulated backends<br/>Entra ID, Intune, M365,<br/>monitoring, logs, HR]
+    AG -->|work notes, caller comments,<br/>assignment, approval| SN
+    ST[(DynamoDB<br/>approvals, idempotency,<br/>lifecycle checkpoints)] --- FW
+    DEMO[Public demo] -.->|dry run, simulated only,<br/>state per request| AG
+```
+
+**Security model**
+- The model never holds credentials. It can only call registered tools; each tool's handler uses
+  server-side clients, and every call passes the policy first.
+- Identity comes from the server: `verify_caller_identity` sends an MFA push to the caller's registered
+  device. The model can't mark anyone verified, and arguments like `identity_verified: true` are ignored.
+- Scope: account, mailbox, device, and log tools act only on the caller (the ServiceNow caller, not a
+  name in the ticket text). Lifecycle changes must come from the employee's manager, never the employee.
+- Approvals are bound to the exact tool, arguments, ticket, and caller (a hash), are single-use, and can't
+  be approved by the requester or by anyone without the role (manager, group owner, HR). Approved actions
+  run in code, with no model involved.
+- Credentials: temporary passwords are random (16 characters, all character classes), unique per reset,
+  sent only through the secure channel, and never appear in tool results, tickets, logs, the audit
+  trail, or the demo. Audit entries are redacted recursively.
+- Failure recovery: throttling is retried with backoff; a timed-out read is retried; a timed-out write is
+  never repeated ("unknown outcome", escalated); every write is keyed for idempotency, so SQS
+  redelivery can't double-execute; lifecycle runs checkpoint each step and resume.
+- The public demo runs the same agent with `simulated_only=True`, a fictional caller, in-memory state per
+  request, and `DryRunDesk`: it can't reach ServiceNow or any real tool.
+
+**Try it**
+- Public demo: ask "I'm locked out of my account" (verify identity -> unlock -> confirm), "I need access
+  to the Finance Reports SharePoint site" (approval from the group owner), "My laptop is really slow and
+  Outlook keeps crashing" (device, logs, mailbox diagnostics), or "VPN keeps disconnecting".
+- ServiceNow (after `servicenow_setup.py` creates the fictional employees): create an incident with
+  caller **Alex Rivera**, "I'm locked out of my account" -> the agent verifies, unlocks (simulated), and
+  asks Alex to confirm. Caller **Taylor Kim**, "I need access to the Finance Reports site" -> Approval =
+  Requested; log in as **Sam Ortiz** (the group owner) and set Approval to Approved -> the agent adds the
+  member and asks Taylor to confirm. Setting it as anyone else is refused and logged.
+
+**Outstanding**
+- Real integrations for workflows 1-4, 6, 10, 11 need a test Microsoft Entra ID / M365 tenant with an
+  app registration scoped to test users (Graph permissions such as `User-PasswordProfile.ReadWrite.All`,
+  `GroupMember.ReadWrite.All`, `DeviceManagementManagedDevices.PrivilegedOperations.All`).
+- Simulated backend state lives in memory per Lambda invocation (approved actions run against fresh
+  simulated data). Approvals, idempotency keys, and lifecycle checkpoints are persisted in DynamoDB.
+- Not yet measured live in ServiceNow: the 12-workflow scenarios have unit and integration tests only.
+
+
 ## Public demo
 
 A public version of the chat lets anyone try the assistant without an account. It is isolated from
@@ -195,13 +290,14 @@ the private integration above and built to be safe to leave running:
 | Answers only | No ticket creation, escalation, or ServiceNow writes; the front end shows no ticket button and the API never offers one |
 | Synthetic data | The 12 sample articles for a fictional company; visitors are asked not to enter personal data, and PII is masked anyway |
 | Secrets server-side | The demo key lives in Streamlit secrets on the server; the browser never sees it or the API URL |
-| Server-side quotas | Atomic DynamoDB counters: 15 questions per visitor per hour (salted hash of the client IP, never stored raw) and 300 per day for everyone. Over the cap, the API returns `429` before any paid call. If the counter store fails, the demo fails closed |
+| Server-side quotas | Atomic DynamoDB counters: 15 questions per visitor per hour (salted hash of the client IP, never stored raw) and 100 per day for everyone (`DemoDailyCap`). Over the cap, the API returns `429` before any paid call. If the counter store fails, the demo fails closed |
 | Input limits | Questions over 300 characters are rejected; only the last 2 turns of history are used |
 | Rate limit | API Gateway throttle on the demo route: 1 request/second, burst 3 |
 | Same guardrails | PII masking, denied topics, prompt-attack filter, contextual grounding |
 | Spending alerts | AWS Budget on the account with email alerts at 50%, 80%, and 100% (and forecast 100%); plus a monthly spend limit in the Anthropic console and a small prepaid Voyage balance |
 
-The daily cap is the hard ceiling: worst case is 300 questions a day, and
+The daily cap is the hard ceiling. Since the demo also runs the ticket agent (several model calls per
+question), the default is 100 questions a day, and
 `scripts/demo_cost_report.py` reports the measured tokens and cost per question from the logs (and,
 with `--cost-explorer`, what AWS actually billed).
 
@@ -420,7 +516,9 @@ Guardrail text units.
 docs/          12 IT knowledge base articles (Markdown)
 src/           assistant pipeline, retrievers, guardrails, models (incl. tool use), ticket agent
                (agent.py), ticket client, ServiceNow connector, Lambda handlers
-servicenow/    Business Rule scripts (new incident, caller reply) and exported update set
+src/enterprise framework.py (registry, policy, approvals, executor, audit), workflows.py (the 12
+               workflows as tools), sim.py (simulated backends), loganalysis.py, runtime.py
+servicenow/    Business Rule scripts (new incident, caller reply, approval decision) and exported update set
 ui/app.py      Streamlit chat (local or deployed mode)
 evals/         golden set + eval runner
 scripts/       build_index.py, sync_vectors.py, sync_kb.py, ask.py,

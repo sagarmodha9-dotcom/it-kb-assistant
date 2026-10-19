@@ -16,7 +16,10 @@ What it does:
   5. Creates the Business Rules on the incident table: new incident (servicenow/business_rule.js)
      and caller reply (servicenow/business_rule_reply.js, for the agent's confirm-the-fix step).
   6. Creates the assignment groups the agent escalates to, if they're missing.
-  7. Checks the service account can log in.
+  7. Creates the fictional employees of the simulated directory (enterprise/sim.py) as ServiceNow
+     users, so incidents can have those callers and approvers (approvers get the itil role so they
+     can set an incident's Approval field). No passwords are set.
+  8. Checks the service account can log in.
 
 The admin password is read with a hidden prompt (or SN_ADMIN_PASSWORD) and is never stored.
 """
@@ -31,12 +34,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from agent import TEAMS  # noqa: E402
+from enterprise.sim import SEED  # noqa: E402
 from servicenow import ServiceNowClient, ServiceNowError  # noqa: E402
 
 UPDATE_SET = "KB Assistant Integration"
 SERVICE_USER = "svc_kb_assistant"
 RULE_NAME = "KB Assistant - AI work note"  # sys_script names are limited to 40 characters
 REPLY_RULE_NAME = "KB Assistant - caller reply"
+APPROVAL_RULE_NAME = "KB Assistant - approval decision"
 
 
 def stack_output(stack: str, region: str, key: str) -> str:
@@ -141,7 +146,23 @@ def main():
             sn.create("sys_user_group", {"name": team, "description": "Created for the KB Assistant ticket agent."})
             print(f"   created {team}")
 
-    print("7. Service account login check")
+    with open(os.path.join(ROOT, "servicenow", "business_rule_approval.js")) as f:
+        approval_script = f.read()
+    upsert(sn, "sys_script", f"name={APPROVAL_RULE_NAME}",
+           {"name": APPROVAL_RULE_NAME, "collection": "incident", "when": "after", "action_update": "true",
+            "active": "true", "advanced": "true", "order": "1000", "script": approval_script,
+            "description": "When an approver approves or rejects an AI agent request, runs or cancels it."})
+
+    print("7. Simulated directory people as ServiceNow users")
+    for user_id, person in SEED["users"].items():
+        first, last = person["name"].split(" ", 1)
+        sys_id = upsert(sn, "sys_user", f"user_name={user_id}",
+                        {"user_name": user_id, "first_name": first, "last_name": last, "active": "true",
+                         "title": person.get("title", ""), "email": f"{user_id}@example.com"})
+        if person.get("roles") and not sn.query("sys_user_has_role", f"user={sys_id}^role={itil}", fields="sys_id", limit=1):
+            sn.create("sys_user_has_role", {"user": sys_id, "role": itil})
+
+    print("8. Service account login check")
     if not args.keep_secrets:
         try:
             ServiceNowClient(args.instance, SERVICE_USER, password).query("incident", fields="number", limit=1)

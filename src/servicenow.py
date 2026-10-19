@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 SYS_ID = re.compile(r"[0-9a-f]{32}")
 NUMBER = re.compile(r"[A-Z]{2,8}\d{4,12}")
 FIELDS = ("sys_id,number,short_description,description,active,work_notes,comments,priority,state,"
-          "assigned_to,caller_id")
+          "assigned_to,caller_id,approval,sys_updated_by")
 MAX_DESCRIPTION = 700  # keep the question within the assistant's 1000-character limit
 
 NOTE_HEADER = "[AI Suggested Response - IT KB Assistant]"

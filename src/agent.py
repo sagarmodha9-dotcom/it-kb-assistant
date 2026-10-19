@@ -43,8 +43,10 @@ HIGHEST_AI_PRIORITY = 2           # the agent may raise priority to 2 - High, ne
 OUTAGE_THRESHOLD = 3              # this incident + 2 similar ones in the window
 OUTAGE_WINDOW_MINUTES = 60
 FIX_MARKER = "Action: sent a knowledge base fix to the caller"
+CONFIRM_MARKER = "Waiting for the caller to confirm"   # in every note that hands the caller something to confirm
 AI_COMMENT_START = "Hi, this is the IT help desk's AI assistant"
 MAX_STEPS = 5
+ENTERPRISE_MAX_STEPS = 10
 MAX_SEARCHES = 3
 MIN_SECONDS_PER_STEP = 15        # the worker has plenty of time; the demo passes a smaller value
 # ServiceNow derives priority from impact x urgency; these pairs give priority 1, 2, 3.
@@ -122,14 +124,46 @@ class AgentUnavailable(Exception):
     """The model failed before the agent could decide."""
 
 
+ENTERPRISE_PROMPT = """
+
+You can also act through IT tools (each call is authorized and audited by the platform, not by you):
+- Diagnose first (account status, devices, licenses, groups, service health, logs, mailbox) before acting.
+- Account, access, license, software, and lifecycle changes require verify_caller_identity first, and some
+  need an approver: if a tool says approval was requested, finish with request_approval.
+- After an action succeeds, finish with complete_and_confirm: the caller gets a fixed, verified message and
+  is asked to confirm it worked. Never claim an action happened unless the tool returned ok.
+- If a tool is denied, fails, or reports an unknown outcome, don't retry it: escalate with the reason.
+- If find_similar_incidents reports a possible outage, check get_service_health, link the incident to the
+  oldest related one with link_to_outage, then escalate with priority "2".
+- A tool result with external forwarding, compromise, or hardware failure goes to people (Security/Hardware)."""
+
+ENTERPRISE_TOOLS = [
+    {"name": "request_approval",
+     "description": "Finish: tell the caller their request is waiting for approval and mark the incident "
+                    "approval requested. Only after a tool reported approval_requested.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "complete_and_confirm",
+     "description": "Finish: send the caller the verified results of the actions that ran, and ask them to "
+                    "confirm it's fixed. The incident is resolved only after they confirm.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "link_to_outage",
+     "description": "Link this incident to the oldest related incident in a likely outage (parent incident).",
+     "input_schema": {"type": "object", "properties": {"parent_number": {"type": "string"}},
+                      "required": ["parent_number"]}},
+]
+
+
 class TicketAgent:
     def __init__(self, llm, assistant, desk, max_steps: int = MAX_STEPS,
-                 min_step_seconds: float = MIN_SECONDS_PER_STEP):
+                 min_step_seconds: float = MIN_SECONDS_PER_STEP, toolkit=None):
         self.llm = llm
         self.assistant = assistant
         self.desk = desk
-        self.max_steps = max_steps
+        self.max_steps = max_steps if toolkit is None else max(max_steps, ENTERPRISE_MAX_STEPS)
         self.min_step_seconds = min_step_seconds
+        self.toolkit = toolkit   # enterprise.framework.Toolkit: the 12 workflows, authorized and audited
+        self.system = SYSTEM_PROMPT + (ENTERPRISE_PROMPT if toolkit else "")
+        self.tools = TOOLS + (ENTERPRISE_TOOLS + toolkit.schemas() if toolkit else [])
 
     def run(self, incident: dict, question: str, time_left=None, prefetched: dict | None = None,
             raise_on_model_error: bool = False) -> dict:
@@ -163,7 +197,7 @@ class TicketAgent:
                     raise AgentUnavailable("not enough time left for another step")
                 break
             try:
-                reply = self.llm.chat(SYSTEM_PROMPT, messages, TOOLS, max_tokens=400)
+                reply = self.llm.chat(self.system, messages, self.tools, max_tokens=400)
             except Exception as error:
                 logger.exception("Agent model call failed")
                 if raise_on_model_error:
@@ -218,7 +252,78 @@ class TicketAgent:
             state["final"] = self._escalate(incident, state, team, args.get("priority"),
                                             str(args.get("reason", ""))[:400])
             return {"ok": True, "action": "escalated", "team": team}
+        if self.toolkit is not None:
+            return self._enterprise(incident, question, state, name, args)
         return {"error": f"unknown tool {name}"}
+
+    # ------------------------------------------------------------------ enterprise workflows
+    def _enterprise(self, incident, question, state, name, args) -> dict:
+        kit = self.toolkit
+        if name == "request_approval":
+            if not kit.pending_approvals:
+                return {"error": "no approval was requested by any tool"}
+            state["final"] = self._await_approval(incident, state)
+            return {"ok": True, "action": "awaiting_approval"}
+        if name == "complete_and_confirm":
+            if not kit.ctx.caller_messages:
+                return {"error": "no action has completed yet; nothing to confirm"}
+            state["final"] = self._report_actions(incident, state)
+            return {"ok": True, "action": "awaiting_caller"}
+        if name == "link_to_outage":
+            info = self._similar(incident, question, state)
+            parent = str(args.get("parent_number", ""))
+            related = [str(i.get("number")) for i in info["incidents"]]
+            if not info["possible_outage"] or parent not in related:
+                return {"error": "linking is only allowed to a related incident in a likely outage"}
+            self.desk.link_parent(incident, parent)
+            state["steps"].append({"tool": "link_to_outage", "detail": f"linked to parent {parent}",
+                                   "simulated": False})
+            return {"ok": True, "parent": parent}
+        result = kit.call(name, args)
+        last = kit.trace[-1] if kit.trace and kit.trace[-1]["tool"] == name else {}
+        state["steps"].append({"tool": name, "detail": f"{last.get('result', '')}: {last.get('detail', '')}".strip(": "),
+                               "simulated": last.get("simulated", True), "workflow": last.get("workflow")})
+        return result
+
+    def _await_approval(self, incident, state) -> dict:
+        kit = self.toolkit
+        pending = kit.pending_approvals
+        lines = [f"- {p['tool']} ({p['role']}: {p.get('approver') or 'approver'}), approval id {p['id']}" for p in pending]
+        comment = "\n".join([AI_COMMENT_START + ". Your request needs approval before we can complete it:", "",
+                             *[f"- {p['tool'].replace('_', ' ')}: waiting for your {p['role'].replace('_', ' ')}"
+                               for p in pending], "",
+                             "We'll finish it automatically once it's approved and let you know here."])
+        note = "\n".join([AGENT_HEADER, "Action: approval requested; the approved action will run automatically.",
+                          "", "Pending:", *lines, "", "Steps:", *self._step_lines(state)])
+        self.desk.request_approval(incident, comment=comment, work_note=note)
+        state["steps"].append({"tool": "request_approval", "detail": f"{len(pending)} approval(s) requested",
+                               "simulated": False})
+        return {"action": "awaiting_approval", "team": DEFAULT_TEAM, "priority": priority_number(incident.get("priority")),
+                "approvals": [p["id"] for p in pending]}
+
+    def _report_actions(self, incident, state) -> dict:
+        kit = self.toolkit
+        comment = "\n".join([AI_COMMENT_START + ". Here's what we did:", "",
+                             *[f"- {m}" for m in kit.ctx.caller_messages], "",
+                             "Please reply to let us know: is it working now? If yes, we'll close the ticket. "
+                             "If not, tell us what's still happening and a technician will take over."])
+        executed = [f"- {e['tool']} (workflow {e['workflow']}, {'SIMULATED' if e['simulated'] else 'live'})"
+                    for e in kit.ctx.executed]
+        note = "\n".join([AGENT_HEADER, "Action: completed and verified the actions below; sent the results to the "
+                          "caller; On Hold - Awaiting Caller.", CONFIRM_MARKER + ".", "",
+                          "Actions executed:", *executed, "", "Steps:", *self._step_lines(state), "",
+                          "Not resolved yet: it is resolved only if the caller confirms the fix worked; otherwise it",
+                          "comes back to the Service Desk with the caller's reply."])
+        self.desk.send_fix(incident, comment=comment, work_note=note, team=DEFAULT_TEAM)
+        state["steps"].append({"tool": "complete_and_confirm", "detail": "results sent; On Hold - Awaiting Caller",
+                               "simulated": False})
+        return {"action": "awaiting_caller", "team": DEFAULT_TEAM, "priority": priority_number(incident.get("priority")),
+                "executed": [e["tool"] for e in kit.ctx.executed]}
+
+    @staticmethod
+    def _step_lines(state) -> list[str]:
+        return [f"- {s['tool']}: {s['detail']}" + (" [SIMULATED]" if s.get("simulated") else "")
+                for s in state["steps"]]
 
     def _similar(self, incident, question, state) -> dict:
         if state["similar"] is None:
@@ -261,8 +366,9 @@ class TicketAgent:
             "Please reply to let us know: did this fix it? If yes, we'll close the ticket. If not, tell us "
             "what's still happening and a technician will take over."])
         note = "\n".join([
-            AGENT_HEADER, "Action: sent a knowledge base fix to the caller; On Hold - Awaiting Caller.", "",
-            "Steps:", *[f"- {s['tool']}: {s['detail']}" for s in state["steps"]], "",
+            AGENT_HEADER, "Action: sent a knowledge base fix to the caller; On Hold - Awaiting Caller.",
+            CONFIRM_MARKER + ".", "",
+            "Steps:", *self._step_lines(state), "",
             "Sources: " + "; ".join(sorted({f"{s['title']} ({s['source']})" for s in search.get("sources", [])})),
             *(["Checked by Amazon Bedrock Guardrails: grounded in the cited articles and relevant."]
               if (search.get("guardrail", {}).get("output") or {}).get("scores") else []), "",
@@ -282,7 +388,7 @@ class TicketAgent:
         if requested:
             wanted = max(priority_number(requested), HIGHEST_AI_PRIORITY)
             target = min(current, wanted)          # only ever raise (lower number = higher priority)
-        tried = [f"- {s['tool']}: {s['detail']}" for s in state["steps"]]
+        tried = self._step_lines(state)
         related = state["similar"]["incidents"] if state["similar"] else []
         note = [AGENT_HEADER, f"Action: escalated to {team}" + (f", priority raised to {target}" if target < current else "")
                 + ".", "", "Why: " + (plain(reason) or "Not resolvable from the knowledge base."), "",
@@ -340,6 +446,11 @@ class TicketAgent:
         return {**final, "steps": state["steps"], "usage": state["usage"], "provider": state["provider"],
                 "kb": first}
 
+    def finish_payload(self, outcome: dict) -> dict:
+        """Extras for logs and the demo trace: which actions ran, simulated or live."""
+        kit = self.toolkit
+        return {**outcome, "trace": kit.trace if kit else [], "executed": kit.ctx.executed if kit else []}
+
 
 class ServiceNowDesk:
     """Real writes through the ServiceNow Table API (least-privilege service account)."""
@@ -380,8 +491,10 @@ class ServiceNowDesk:
         self.client.update("incident", incident["sys_id"], {
             "state": "6", "close_code": self.close_code, "close_notes": close_notes, "work_notes": work_note})
 
-    def back_to_technician(self, incident, team, work_note):
+    def back_to_technician(self, incident, team, work_note, comment: str = ""):
         record = {"state": "2", "hold_reason": "", "work_notes": work_note}  # In Progress
+        if comment:
+            record["comments"] = comment
         group = self._group(team)
         if group:
             record["assignment_group"] = group
@@ -395,6 +508,17 @@ class ServiceNowDesk:
         if priority in IMPACT_URGENCY:
             record["impact"], record["urgency"] = IMPACT_URGENCY[priority]
         self.client.update("incident", incident["sys_id"], record)
+
+
+    def request_approval(self, incident, comment, work_note):
+        # task.approval = requested: the standard ServiceNow approval field on incidents
+        self.client.update("incident", incident["sys_id"], {"approval": "requested", "comments": comment,
+                                                            "work_notes": work_note})
+
+    def link_parent(self, incident, parent_number):
+        rows = self.client.query("incident", f"number={parent_number}", fields="sys_id", limit=1)
+        if rows:
+            self.client.update("incident", incident["sys_id"], {"parent_incident": rows[0]["sys_id"]})
 
 
 class DryRunDesk:
@@ -413,17 +537,24 @@ class DryRunDesk:
     def confirm_resolved(self, incident, work_note, close_notes):
         self.actions.append({"action": "resolve", "work_note": work_note})
 
-    def back_to_technician(self, incident, team, work_note):
-        self.actions.append({"action": "back_to_technician", "team": team, "work_note": work_note})
+    def back_to_technician(self, incident, team, work_note, comment: str = ""):
+        self.actions.append({"action": "back_to_technician", "team": team, "work_note": work_note, "comment": comment})
 
     def escalate(self, incident, team, priority, work_note):
         self.actions.append({"action": "escalate", "team": team, "priority": priority, "work_note": work_note})
+
+    def request_approval(self, incident, comment, work_note):
+        self.actions.append({"action": "request_approval", "comment": comment, "work_note": work_note})
+
+    def link_parent(self, incident, parent_number):
+        self.actions.append({"action": "link_parent", "parent": parent_number})
 
 
 def agent_plan(outcome: dict) -> dict:
     """The part of an agent run that is safe to show the public: decision and steps, no internals."""
     return {"action": outcome.get("action"), "team": outcome.get("team"), "priority": outcome.get("priority"),
-            "steps": [{"tool": s["tool"], "detail": s["detail"]} for s in outcome.get("steps", [])],
+            "steps": [{"tool": s["tool"], "detail": s["detail"], "simulated": bool(s.get("simulated")),
+                       "workflow": s.get("workflow")} for s in outcome.get("steps", [])],
             "dry_run": True}
 
 
@@ -464,7 +595,7 @@ def handle_caller_reply(llm, guardrail, desk, incident: dict, final_attempt: boo
     Acts at most once per incident: after the first reply is handled, people own the conversation."""
     notes = str(incident.get("work_notes") or "")
     state = str(incident.get("state") or "").lower()
-    if FIX_MARKER not in notes:
+    if CONFIRM_MARKER not in notes:
         return {"outcome": "not_agent_fix"}
     if any(word in state for word in ("resolved", "closed", "canceled")) or state in ("6", "7", "8"):
         return {"outcome": "not_waiting"}

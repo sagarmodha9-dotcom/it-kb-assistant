@@ -77,6 +77,11 @@ Parameters:
     AllowedValues: [agent, suggest]
     Default: agent
     Description: "agent: the AI sends a verified KB fix and waits for the caller to confirm, or escalates to a team. suggest: work-note suggestions only."
+  ServiceNowEnterprise:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: "Give the ticket agent the 12 enterprise IT workflow tools (simulated Entra ID, Intune, M365, HR backends; real ServiceNow and KB)."
   ServiceNowPasswordParam:
     Type: String
     Description: SSM SecureString holding the service account's password.
@@ -103,8 +108,8 @@ Parameters:
     Default: /it-kb-assistant/demo-api-key
   DemoDailyCap:
     Type: Number
-    Description: Hard ceiling on demo questions per day (UTC), across all visitors.
-    Default: 300
+    Description: Hard ceiling on demo questions per day (UTC), across all visitors. Each question can run the agent (several model calls).
+    Default: 100
   DemoVisitorHourlyCap:
     Type: Number
     Description: Demo questions per visitor per hour.
@@ -495,6 +500,21 @@ Resources:
         maxReceiveCount: 3
 
   # One AI note per incident: the webhook claims each sys_id here before queueing it.
+  EnterpriseStateTable:
+    Type: AWS::DynamoDB::Table
+    Condition: UseServiceNow
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
   ServiceNowIdempotencyTable:
     Type: AWS::DynamoDB::Table
     Condition: UseServiceNow
@@ -559,6 +579,8 @@ Resources:
           SN_PASSWORD_PARAM: !Ref ServiceNowPasswordParam
           SN_MAX_RECEIVES: "3"
           SN_MODE: !Ref ServiceNowMode
+          SN_ENTERPRISE: !Ref ServiceNowEnterprise
+          ENTERPRISE_TABLE: !Ref EnterpriseStateTable   # approvals, idempotency keys, lifecycle checkpoints
           SN_CLOSE_CODE: Solution provided
       Policies:
         - !Ref AssistantRuntimePolicy
@@ -566,6 +588,11 @@ Resources:
             - Effect: Allow
               Action: ssm:GetParameter
               Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ServiceNowPasswordParam}
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource: !GetAtt EnterpriseStateTable.Arn
       Events:
         Incidents:
           Type: SQS
@@ -637,6 +664,7 @@ Resources:
           DEMO_VISITOR_HOURLY_CAP: !Ref DemoVisitorHourlyCap
           DEMO_MAX_QUESTION: "300"
           DEMO_AGENT: "true"   # also show the ticket agent's plan (dry run: writes nothing)
+          DEMO_ENTERPRISE: "true"   # with the 12 workflows, simulated tools only
       Policies:
         - !Ref AssistantRuntimePolicy
         - Statement:

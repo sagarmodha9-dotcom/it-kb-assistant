@@ -44,9 +44,19 @@ MAX_QUESTION = 300 if PUBLIC_DEMO else 1000
 REPO = "https://github.com/sagarmodha9-dotcom/it-kb-assistant"
 REPO_DOCS = f"{REPO}/blob/main/docs/"
 EXAMPLES = ["How do I set up MFA on my new phone?",
-            "My laptop is asking for a 48-digit key after an update",
-            "A visitor needs Wi-Fi tomorrow. What do they use?",
+            "I'm locked out of my account",
+            "I need access to the Finance Reports SharePoint site",
             "What's on the cafeteria menu today?"]
+# (workflow, real or simulated in this project)
+AGENT_WORKFLOWS = [("Password reset and account unlock", "Simulated"), ("Intune device diagnostics", "Simulated"),
+                   ("Microsoft 365 license management", "Simulated"), ("Group membership and access", "Simulated"),
+                   ("VPN troubleshooting", "KB real, monitoring simulated"), ("Software installation", "Simulated"),
+                   ("Incident triage and assignment", "Real (ServiceNow)"),
+                   ("Outage detection and coordination", "Real (ServiceNow), monitoring simulated"),
+                   ("Log analysis and root cause", "Analysis real, logs simulated"),
+                   ("Outlook and Microsoft 365 diagnostics", "Simulated"),
+                   ("Onboarding and offboarding", "Simulated"),
+                   ("Follow-up and resolution verification", "Real (ServiceNow)")]
 STEPS = [("Screen the question", "Prompt attacks and off-topic requests are blocked, and personal "
                                  "details are masked before anything else sees them."),
          ("Search the articles", "Voyage AI embeddings in Amazon S3 Vectors find the passages that "
@@ -132,6 +142,11 @@ sup.kb-cite { display: inline-flex; align-items: center; justify-content: center
 .kb-agent li { font-size: .84rem; color: var(--muted); line-height: 1.5; margin: .1rem 0; }
 .kb-agent li b { color: var(--ink); font-weight: 500; }
 .kb-agent-foot { font-size: .78rem; color: var(--muted); }
+.kb-sim { font-size: .68rem; font-weight: 600; color: var(--warn); background: var(--warn-bg); border-radius: 4px;
+  padding: 0 .3rem; margin-left: .2rem; }
+[data-testid="stSidebar"] ul.kb-flows { list-style: none; padding: 0; margin: .3rem 0 0; }
+[data-testid="stSidebar"] .kb-flows li { font-size: .82rem; padding: .25rem 0; margin: 0; border-bottom: 1px solid var(--line); }
+[data-testid="stSidebar"] .kb-flows li span { display: block; color: var(--muted); font-size: .74rem; }
 
 [data-testid="stSidebar"] { border-right: 1px solid var(--line); }
 [data-testid="stSidebar"] h3 { font-size: .95rem; font-weight: 600; margin-top: .6rem; }
@@ -282,25 +297,34 @@ def demo_text(text: str) -> str:
 AGENT_STEP_NAMES = {"search_knowledge_base": "Searched the knowledge base",
                     "find_similar_incidents": "Checked for similar incidents",
                     "send_fix_to_caller": "Sent the fix to the caller",
-                    "escalate_incident": "Escalated"}
+                    "escalate_incident": "Escalated",
+                    "verify_caller_identity": "Verified identity (MFA push)",
+                    "complete_and_confirm": "Sent results, asked the caller to confirm",
+                    "request_approval": "Requested approval",
+                    "link_to_outage": "Linked to the outage incident"}
 
 
 def agent_html(plan: dict) -> str:
     """What the ticket agent would do with this as a new ServiceNow incident (dry run in the demo)."""
     if plan.get("action") == "awaiting_caller":
-        badge, decision = "ok", "Would send this fix to the caller and wait for them to confirm it worked"
+        badge, decision = "ok", "Would send this to the caller and resolve only after they confirm it worked"
+    elif plan.get("action") == "awaiting_approval":
+        badge, decision = "warn", "Would wait for an approver, then run the approved action automatically"
     else:
         badge = "warn"
         decision = f"Would escalate to the {html.escape(str(plan.get('team')))} team"
         if plan.get("priority") and int(plan["priority"]) <= 2:
             decision += f", priority {int(plan['priority'])} - High"
-    steps = "".join(f"<li><b>{html.escape(AGENT_STEP_NAMES.get(st_['tool'], st_['tool']))}</b>: "
-                    f"{html.escape(str(st_.get('detail', '')))}</li>" for st_ in plan.get("steps", []))
+    steps = "".join(f"<li><b>{html.escape(AGENT_STEP_NAMES.get(st_['tool'], st_['tool'].replace('_', ' ').capitalize()))}</b>"
+                    + (' <span class="kb-sim">simulated</span>' if st_.get("simulated") else "")
+                    + f": {html.escape(str(st_.get('detail', '')))}</li>" for st_ in plan.get("steps", []))
     return (f'<div class="kb-agent"><div class="kb-agent-head"><span class="kb-agent-title">Ticket agent</span>'
-            f'<span class="kb-badge {badge}">{"Self-service" if badge == "ok" else "Escalate"}</span>'
+            f'<span class="kb-badge {badge}">{"Self-service" if badge == "ok" else ("Approval" if plan.get("action") == "awaiting_approval" else "Escalate")}</span>'
             f'<span class="kb-agent-decision">{decision}</span></div><ol>{steps}</ol>'
-            '<div class="kb-agent-foot">In the ServiceNow integration this runs on every new incident. '
-            "A ticket is resolved only after the caller confirms. Dry run: nothing is written in this demo.</div></div>")
+            '<div class="kb-agent-foot">Demo caller: Alex Rivera, an employee of a fictional company. Steps marked '
+            "simulated run against simulated Entra ID, Intune, and Microsoft 365 backends; nothing real is changed "
+            "and nothing is written. In the ServiceNow integration this runs on every new incident, and a ticket "
+            "is resolved only after the caller confirms.</div></div>")
 
 
 def show_turn(i: int, turn: dict) -> None:
@@ -369,6 +393,10 @@ with st.sidebar:
                  (f" ({setting({}, 'EMBEDDER')})" if setting({}, "RETRIEVER") == "local" else ""))
         st.write(f"Model: `{setting({}, 'LLM_PROVIDER')}`")
         st.write(f"Guardrail: `{setting({}, 'GUARDRAIL')}`")
+    if PUBLIC_DEMO:
+        st.markdown("### What the agent can do")
+        st.markdown('<ul class="kb-flows">' + "".join(f"<li>{n}<span>{k}</span></li>" for n, k in AGENT_WORKFLOWS)
+                    + "</ul>", unsafe_allow_html=True)
     st.markdown("### What it knows")
     st.markdown('<ul class="kb-articles">' + "".join(
         f'<li><a href="{REPO_DOCS}{name}" target="_blank">{html.escape(title)}</a></li>'
