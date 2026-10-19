@@ -1,5 +1,5 @@
 /**
- * Business Rule: "KB Assistant - suggest answer on new incident"
+ * Business Rule: "KB Assistant - AI work note"
  * Table: incident | When: async (after insert, in the background, so agents never wait) | Insert: true
  *
  * Sends only the incident's sys_id and number to the AWS webhook. The worker then reads the incident

@@ -32,7 +32,7 @@ from servicenow import ServiceNowClient, ServiceNowError  # noqa: E402
 
 UPDATE_SET = "KB Assistant Integration"
 SERVICE_USER = "svc_kb_assistant"
-RULE_NAME = "KB Assistant - suggest answer on new incident"
+RULE_NAME = "KB Assistant - AI work note"  # sys_script names are limited to 40 characters
 
 
 def stack_output(stack: str, region: str, key: str) -> str:

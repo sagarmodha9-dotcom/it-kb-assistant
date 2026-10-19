@@ -79,7 +79,8 @@ class ServiceNowClient:
                 raise ServiceNowError(f"ServiceNow {method} {path.split('?')[0]} failed: HTTP {error.code}",
                                       error.code) from error
             except (OSError, ValueError, http.client.HTTPException) as error:  # timeouts, bad JSON
-                if wait is not None:
+                # A timed-out POST may still have created the record, so only retry safe methods.
+                if wait is not None and method in ("GET", "PATCH", "DELETE"):
                     self.sleep(wait)
                     continue
                 raise ServiceNowError(f"ServiceNow request failed: {type(error).__name__}") from error

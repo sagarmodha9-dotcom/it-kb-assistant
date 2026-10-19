@@ -277,3 +277,15 @@ def test_worker_drops_cached_credentials_on_401():
     out = app.servicenow_worker({"Records": [record({"sys_id": SYS_ID})]}, None)
     assert out["batchItemFailures"] and "servicenow" not in app._cache and "sn_password" not in app._cache
     app._cache.clear()
+
+
+def test_timed_out_post_is_not_retried():
+    class Timeout:
+        calls = 0
+
+        def __call__(self, request, timeout=None):
+            Timeout.calls += 1
+            raise TimeoutError("slow")
+    with pytest.raises(ServiceNowError):
+        client(Timeout()).create("incident", {"short_description": "x"})
+    assert Timeout.calls == 1  # a retry could create a duplicate incident
