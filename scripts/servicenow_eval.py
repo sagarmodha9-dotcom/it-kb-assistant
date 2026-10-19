@@ -76,7 +76,7 @@ def main():
     args = parser.parse_args()
 
     password = os.environ.get("SN_ADMIN_PASSWORD") or getpass.getpass(f"ServiceNow {args.admin_user} password: ")
-    sn = ServiceNowClient(args.instance, args.admin_user, password)
+    sn = ServiceNowClient(args.instance, args.admin_user, password, timeout=60)
     with open(os.path.join(ROOT, "evals", "golden.jsonl")) as f:
         cases = [json.loads(line) for line in f if line.strip()]
     cases = [c for c in cases if c["type"] in TYPES and (not args.only or c["type"] == args.only)]

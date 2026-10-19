@@ -71,7 +71,7 @@ def main():
     args = parser.parse_args()
 
     admin_password = os.environ.get("SN_ADMIN_PASSWORD") or getpass.getpass(f"ServiceNow {args.admin_user} password: ")
-    sn = ServiceNowClient(args.instance, args.admin_user, admin_password)
+    sn = ServiceNowClient(args.instance, args.admin_user, admin_password, timeout=120)
     webhook_url = stack_output(args.stack, args.region, "ServiceNowWebhookUrl")
 
     print("1. Update set")
