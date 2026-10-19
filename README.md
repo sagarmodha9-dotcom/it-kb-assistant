@@ -66,6 +66,12 @@ reads it and adds a **work note** with a suggested resolution and the KB article
 Work notes are internal, so only IT staff see them. **The AI only suggests:** it never changes the
 state, priority, or assignment, and never contacts the caller.
 
+![A new ServiceNow incident gets a cited AI work note from the KB Assistant](assets/servicenow-ai-work-note-demo.gif)
+
+*Live run on a ServiceNow developer instance: a new incident ("my laptop is asking for a 48-digit key")
+is submitted, and about 9 seconds later the KB Assistant has added a work note with the BitLocker
+recovery steps, the cited article, and the guardrail check.*
+
 ```mermaid
 flowchart LR
     I[New incident] --> BR[Business Rule<br/>async, after insert]
