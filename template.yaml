@@ -85,7 +85,35 @@ Parameters:
     Description: Optional email for the dead-letter-queue alarm (confirm the subscription email). Empty = no email.
     Default: ""
 
+  PublicDemo:
+    Type: String
+    Description: >
+      true = deploy the public recruiter demo route (/demo/ask): separate key, answers only (no tickets,
+      escalation, or ServiceNow), daily and per-visitor caps, and an AWS Budget with email alerts.
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  DemoApiKeyParam:
+    Type: String
+    Description: SSM SecureString with the key only the public demo front end uses.
+    Default: /it-kb-assistant/demo-api-key
+  DemoDailyCap:
+    Type: Number
+    Description: Hard ceiling on demo questions per day (UTC), across all visitors.
+    Default: 300
+  DemoVisitorHourlyCap:
+    Type: Number
+    Description: Demo questions per visitor per hour.
+    Default: 15
+  MonthlyBudgetUsd:
+    Type: Number
+    Description: Monthly AWS cost budget for the account; email alerts at 50%, 80%, 100% and forecast 100%.
+    Default: 10
+
 Conditions:
+  UsePublicDemo: !Equals [!Ref PublicDemo, "true"]
+  DemoBudget: !And
+    - !Condition UsePublicDemo
+    - !Not [!Equals [!Ref AlarmEmail, ""]]
   UseRerank: !Not [!Equals [!Ref RerankModelId, ""]]
   UseServiceNow: !Not [!Equals [!Ref ServiceNowInstanceUrl, ""]]
   SendAlarmEmail: !And
@@ -350,6 +378,12 @@ Resources:
       DefaultRouteSettings:
         ThrottlingRateLimit: 2
         ThrottlingBurstLimit: 5
+      RouteSettings: !If
+        - UsePublicDemo
+        - "POST /demo/ask":
+            ThrottlingRateLimit: 1
+            ThrottlingBurstLimit: 3
+        - !Ref AWS::NoValue
 
   # Everything the assistant needs at runtime: retrieval, the model, the guardrail, and its API keys.
   AssistantRuntimePolicy:
@@ -562,6 +596,77 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: !If [SendAlarmEmail, [!Ref ServiceNowAlarmTopic], !Ref AWS::NoValue]
 
+  # ---------------------------------------------------------- public recruiter demo (PublicDemo=true)
+  # Its own route, function, key, and usage counters. It can only read the knowledge base and answer:
+  # no tickets, no escalation, no ServiceNow. Turning PublicDemo off removes all of it.
+  DemoUsageTable:
+    Type: AWS::DynamoDB::Table
+    Condition: UsePublicDemo
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  DemoAskFunction:
+    Type: AWS::Serverless::Function
+    Condition: UsePublicDemo
+    Properties:
+      Handler: app.demo_ask
+      Description: Public demo - answer from the synthetic knowledge base, with daily and per-visitor caps
+      Environment:
+        Variables:
+          DEMO_API_KEY_PARAM: !Ref DemoApiKeyParam
+          DEMO_TABLE: !Ref DemoUsageTable
+          DEMO_DAILY_CAP: !Ref DemoDailyCap
+          DEMO_VISITOR_HOURLY_CAP: !Ref DemoVisitorHourlyCap
+          DEMO_MAX_QUESTION: "300"
+      Policies:
+        - !Ref AssistantRuntimePolicy
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DemoApiKeyParam}
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt DemoUsageTable.Arn
+      Events:
+        DemoAsk:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AssistantApi
+            Path: /demo/ask
+            Method: POST
+
+  AccountBudget:
+    Type: AWS::Budgets::Budget
+    Condition: DemoBudget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlarmEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlarmEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 100}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlarmEmail}]
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlarmEmail}]
+
 Outputs:
   ApiUrl:
     Value: !Sub https://${AssistantApi}.execute-api.${AWS::Region}.amazonaws.com
@@ -583,3 +688,6 @@ Outputs:
   ServiceNowDeadLetterQueueUrl:
     Condition: UseServiceNow
     Value: !Ref ServiceNowDeadLetterQueue
+  DemoApiUrl:
+    Condition: UsePublicDemo
+    Value: !Sub https://${AssistantApi}.execute-api.${AWS::Region}.amazonaws.com/demo/ask

@@ -103,7 +103,76 @@ A free ServiceNow **Personal Developer Instance** (developer.servicenow.com) is 
 
 ### Results
 
-Results from the first live run will be added here.
+Live run on a ServiceNow developer instance (Australia release), Oct 19 2026: 36 incidents created
+from the golden set (`scripts/servicenow_eval.py`), each scored on the AI work note it received.
+
+| Case type | Correct |
+|---|---|
+| Answerable (right KB article cited) | 25/26 |
+| Personal data in the incident (answered, data not repeated) | 2/2 |
+| Not in the knowledge base (says so, no guessing) | 5/5 |
+| Should be refused (security bypass, prompt injection) | 3/3 |
+| **All** | **35/36**; 36/36 incidents got a note, none lost |
+
+- **Speed:** a single incident gets its note about **18 seconds** after it's saved.
+- **Burst of 36:** the free tier of the embeddings API rate-limited the worker (`429`). Messages went
+  back to the queue and were retried automatically; every incident got its note, and nothing reached the
+  dead-letter queue. A paid embeddings tier removes the bottleneck; the worker's concurrency cap of 2 then
+  sets the pace.
+- **The one miss** is the same question the chat evals miss (`teams-cant-hear`, relevance score 0.04):
+  the ServiceNow path gives the same answers as the chat path.
+
+**Found and fixed during live testing** (each now has a test):
+1. A work-note write that ServiceNow saved slowly was retried and posted twice. Writes are no longer
+   retried on timeouts, and the worker skips incidents that already have an AI note.
+2. A timed-out incident create could be retried into a duplicate. POSTs are never retried on timeouts.
+3. The instance blocks API logins for `admin`, so setup uses a separate API-only (machine identity) account.
+4. Business Rule names are capped at 40 characters; setup now updates the rule in place.
+5. A brand-new instance had 146 overdue background jobs, so the async rule never ran. `--rule-when after`
+   runs it right after the save (the webhook answers in under a second; 5-second cap).
+6. Role assignment and journal reads are slow on a new instance; setup and eval wait longer.
+
+## Public demo
+
+A public version of the chat lets anyone try the assistant without an account. It is isolated from
+the private integration above and built to be safe to leave running:
+
+| Control | How |
+|---|---|
+| Separate surface | Own route (`POST /demo/ask`), Lambda function, and API key. The private `/ask`, `/escalate`, and ServiceNow routes don't accept the demo key |
+| Answers only | No ticket creation, escalation, or ServiceNow writes; the front end shows no ticket button and the API never offers one |
+| Synthetic data | The 12 sample articles for a fictional company; visitors are asked not to enter personal data, and PII is masked anyway |
+| Secrets server-side | The demo key lives in Streamlit secrets on the server; the browser never sees it or the API URL |
+| Server-side quotas | Atomic DynamoDB counters: 15 questions per visitor per hour (salted hash of the client IP, never stored raw) and 300 per day for everyone. Over the cap, the API returns `429` before any paid call. If the counter store fails, the demo fails closed |
+| Input limits | Questions over 300 characters are rejected; only the last 2 turns of history are used |
+| Rate limit | API Gateway throttle on the demo route: 1 request/second, burst 3 |
+| Same guardrails | PII masking, denied topics, prompt-attack filter, contextual grounding |
+| Spending alerts | AWS Budget on the account with email alerts at 50%, 80%, and 100% (and forecast 100%); plus a monthly spend limit in the Anthropic console and a small prepaid Voyage balance |
+
+The daily cap is the hard ceiling: worst case is 300 questions a day, and
+`scripts/demo_cost_report.py` reports the measured tokens and cost per question from the logs (and,
+with `--cost-explorer`, what AWS actually billed).
+
+### Launch checklist
+
+```bash
+aws ssm put-parameter --name /it-kb-assistant/demo-api-key --type SecureString \
+  --value "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+sam build && sam deploy ... --parameter-overrides PublicDemo=true AlarmEmail=you@example.com ...
+python scripts/demo_security_check.py --api <ApiUrl>    # must pass before launch
+python scripts/demo_cost_report.py --hours 1            # measured cost of the checks
+```
+
+Then on [Streamlit Community Cloud](https://streamlit.io/cloud): new app from this repo, main file
+`ui/app.py`, and these secrets (Settings -> Secrets):
+
+```toml
+PUBLIC_DEMO = "true"
+ASSISTANT_API_URL = "https://<api-id>.execute-api.us-west-2.amazonaws.com"
+ASSISTANT_API_KEY = "<the demo key, from SSM>"
+```
+
+Finally, open the app in a logged-out (private) browser window and ask a few questions.
 
 ## Evaluation
 
@@ -248,6 +317,7 @@ python scripts/sync_vectors.py --stack it-kb-assistant --key-param /it-kb-assist
 | Bedrock Knowledge Base + data source | Fixed-size 300-token chunks, 15% overlap, Titan Text Embeddings V2 |
 | Bedrock Guardrail + version | Content filters, prompt-attack filter, 2 denied topics, PII masking, contextual grounding |
 | 2 Lambdas + HTTP API | `/ask` and `/escalate`, x-api-key checked in constant time, 2 req/s throttle |
+| Public demo (optional) | `/demo/ask` Lambda, DynamoDB usage counters, demo route throttle, AWS Budget alerts; deployed only when `PublicDemo=true` |
 | ServiceNow integration (optional) | Webhook + worker Lambdas, SQS queue + dead-letter queue + alarm, DynamoDB idempotency table; deployed only when `ServiceNowInstanceUrl` is set |
 | Optional rerank | `RerankModelId` parameter (e.g. `cohere.rerank-v3-5:0`); off by default |
 
@@ -292,6 +362,7 @@ servicenow/    Business Rule script and exported update set
 ui/app.py      Streamlit chat (local or deployed mode)
 evals/         golden set + eval runner
 scripts/       build_index.py, sync_vectors.py, sync_kb.py, ask.py,
-               servicenow_setup.py, servicenow_eval.py
+               servicenow_setup.py, servicenow_eval.py,
+               demo_security_check.py, demo_cost_report.py
 template.yaml  AWS SAM template
 ```

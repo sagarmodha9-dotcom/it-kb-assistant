@@ -5,6 +5,10 @@ POST /ask       {"question": "...", "history": [...]}    -> cited answer, or an 
 POST /escalate  {"question": "...", "answer": "...",     -> opens a ticket in the AI Ticket Triage API
                  "sources": ["vpn-troubleshooting.md"]}
 
+Public recruiter demo (deployed only when PublicDemo=true):
+POST /demo/ask  {"question": "...", "history": [...]}    separate API key; answers only, no tickets or
+                                                          ServiceNow; daily and per-visitor caps enforced here
+
 ServiceNow integration (see servicenow.py):
 POST /servicenow/events  {"sys_id": "...", "number": "INC0010001"}  called by a ServiceNow Business Rule
                          and signed (x-timestamp + x-signature HMAC-SHA256) -> 202, queued
@@ -271,3 +275,80 @@ def servicenow_worker(event, context):
             logger.exception("Unexpected error on %s (attempt %s)", sys_id, receives)
             failures.append({"itemIdentifier": record["messageId"]})
     return {"batchItemFailures": failures}
+
+
+# ---------------------------------------------------------------- public recruiter demo
+DEMO_MAX_HISTORY = 2
+
+
+def _demo_limit(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _claim(key: str, cap: int, ttl_seconds: int) -> bool:
+    """Atomically count one request against `key`; False once the cap is reached (never goes over)."""
+    try:
+        _aws("dynamodb").update_item(
+            TableName=os.environ["DEMO_TABLE"], Key={"pk": {"S": key}},
+            UpdateExpression="ADD used :one SET expires_at = if_not_exists(expires_at, :exp)",
+            ConditionExpression="attribute_not_exists(used) OR used < :cap",
+            ExpressionAttributeValues={":one": {"N": "1"}, ":cap": {"N": str(cap)},
+                                       ":exp": {"N": str(int(time.time()) + ttl_seconds)}})
+        return True
+    except Exception as error:
+        if getattr(error, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def demo_ask(event, context):
+    """Public demo: same assistant, stricter limits, nothing that writes anywhere except the usage counters."""
+    expected = _secret("demo_api_key", "DEMO_API_KEY_PARAM")
+    if expected is None:
+        return _response(503, {"error": "Demo is not configured."})
+    headers = event.get("headers") or {}
+    if not hmac.compare_digest(headers.get("x-api-key", "").encode(), expected.encode()):
+        return _response(401, {"error": "Missing or invalid x-api-key header."})
+    try:
+        data = _parse(event)
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return _response(400, {"error": "Request body must be valid JSON."})
+    question = " ".join(str(data.get("question", "")).split())
+    max_len = _demo_limit("DEMO_MAX_QUESTION", 300)
+    if not question:
+        return _response(400, {"error": "'question' is required."})
+    if len(question) > max_len:
+        return _response(413, {"error": f"Please keep questions under {max_len} characters."})
+
+    # Usage caps, checked before any paid call. The visitor id is a salted hash, never the raw IP.
+    client = str(headers.get("x-demo-client", ""))[:200] or "unknown"
+    salt = _secret("demo_api_key", "DEMO_API_KEY_PARAM") or ""
+    visitor = hashlib.sha256(f"{salt}:{client}".encode()).hexdigest()[:24]
+    now = time.gmtime()
+    try:
+        if not _claim(f"visitor#{visitor}#{time.strftime('%Y%m%d%H', now)}",
+                      _demo_limit("DEMO_VISITOR_HOURLY_CAP", 15), 2 * 3600):
+            return _response(429, {"error": "You've reached the demo limit for this hour. Please try again later."})
+        if not _claim(f"day#{time.strftime('%Y-%m-%d', now)}", _demo_limit("DEMO_DAILY_CAP", 300), 3 * 86400):
+            return _response(429, {"error": "The demo has reached today's usage limit. Please try again tomorrow."})
+    except Exception:
+        logger.exception("Demo quota check failed")
+        return _response(503, {"error": "The demo is temporarily unavailable."})
+
+    history = data.get("history") if isinstance(data.get("history"), list) else []
+    time_left = (lambda: context.get_remaining_time_in_millis() / 1000 - 2) if context else None
+    try:
+        assistant = _assistant()
+    except Exception:
+        logger.exception("Assistant setup failed")
+        return _response(503, {"error": "The demo is temporarily unavailable."})
+    result = assistant.ask(question, history=history[-DEMO_MAX_HISTORY:], time_left=time_left)
+    result["offer_ticket"] = False  # no tickets, escalation, or ServiceNow writes in the public demo
+    logger.info(json.dumps({"event": "demo_ask", "status": result["status"], "provider": result["provider"],
+                            "sources": [s["source"] for s in result["sources"]], "usage": result["usage"],
+                            "latency_ms": result["latency_ms"]}))
+    return _response(200, {k: result.get(k) for k in
+                           ("status", "answer", "sources", "offer_ticket", "guardrail", "latency_ms", "search_query")})
