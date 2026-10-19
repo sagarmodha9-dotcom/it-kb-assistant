@@ -21,12 +21,12 @@ import time
 QUERY = """
 fields @message
 | filter @message like /"event": "demo_ask"/
-| parse @message '"status": "*"' as status
-| parse @message '"input_tokens": *,' as input_tokens
-| parse @message '"output_tokens": *}' as output_tokens
-| parse @message '"latency_ms": *}' as latency_ms
-| stats count(*) as questions, sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens,
-        avg(latency_ms) as avg_latency_ms, pct(latency_ms, 95) as p95_latency_ms by status
+| parse @message /"status": "(?<st>[^"]+)"/
+| parse @message /"input_tokens": (?<tok_in>\\d+)/
+| parse @message /"output_tokens": (?<tok_out>\\d+)/
+| parse @message /"latency_ms": (?<lat>\\d+)/
+| stats count(*) as questions, sum(tok_in) as input_tokens, sum(tok_out) as output_tokens,
+        avg(lat) as avg_latency_ms, pct(lat, 95) as p95_latency_ms by st
 """
 
 
@@ -71,7 +71,7 @@ def main():
         q, tin, tout = int(row.get("questions", 0)), int(float(row.get("input_tokens") or 0)), \
             int(float(row.get("output_tokens") or 0))
         total_q, total_in, total_out = total_q + q, total_in + tin, total_out + tout
-        print(f"  {row.get('status', '?'):<10} {q:>5} questions  avg {float(row.get('avg_latency_ms') or 0):,.0f} ms"
+        print(f"  {row.get('st', '?'):<10} {q:>5} questions  avg {float(row.get('avg_latency_ms') or 0):,.0f} ms"
               f"  p95 {float(row.get('p95_latency_ms') or 0):,.0f} ms")
     model_cost = total_in / 1e6 * args.input_price + total_out / 1e6 * args.output_price
     print(f"  total      {total_q:>5} questions, {total_in:,} input + {total_out:,} output tokens")
