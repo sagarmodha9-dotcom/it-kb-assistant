@@ -165,7 +165,7 @@ def _servicenow() -> ServiceNowClient:
     if "servicenow" not in _cache:
         password = _secret("sn_password", "SN_PASSWORD_PARAM")
         _cache["servicenow"] = ServiceNowClient(os.environ.get("SN_INSTANCE_URL", ""),
-                                                os.environ.get("SN_USER", ""), password or "")
+                                                os.environ.get("SN_USER", ""), password or "", timeout=25)
     return _cache["servicenow"]
 
 

@@ -100,7 +100,7 @@ def answered():
 def test_work_notes_say_what_the_ai_did():
     note = format_work_note(answered())
     assert note.startswith(NOTE_HEADER) and "[1] VPN (vpn-troubleshooting.md)" in note
-    assert "grounding 0.91" in note and "Review before using" in note
+    assert "Bedrock Guardrails" in note and "Review before using" in note
     assert "No knowledge base article" in format_work_note({"status": "no_answer"})
     assert "security policy" in format_work_note({"status": "blocked"})
     assert "unavailable" in format_work_note({"status": "error"})
@@ -289,3 +289,37 @@ def test_timed_out_post_is_not_retried():
     with pytest.raises(ServiceNowError):
         client(Timeout()).create("incident", {"short_description": "x"})
     assert Timeout.calls == 1  # a retry could create a duplicate incident
+
+
+def test_note_groups_chunks_from_one_article_and_drops_markdown():
+    result = answered()
+    result["answer"] = "**If you have your old phone:** do this [1]. Otherwise call [3]."
+    result["sources"] = [{"n": 1, "title": "MFA", "source": "mfa.md"}, {"n": 3, "title": "MFA", "source": "mfa.md"}]
+    note = format_work_note(result)
+    assert "[1][3] MFA (mfa.md)" in note and note.count("(mfa.md)") == 1
+    assert "**" not in note and "If you have your old phone:" in note
+
+
+def test_work_note_write_is_never_retried():
+    opener = Opener(503)
+    with pytest.raises(ServiceNowError):
+        client(opener).add_work_note(SYS_ID, "note")
+    assert len(opener.requests) == 1  # the first PATCH may have been saved; a retry would duplicate it
+
+    class Timeout:
+        calls = 0
+
+        def __call__(self, request, timeout=None):
+            Timeout.calls += 1
+            raise TimeoutError("slow")
+    with pytest.raises(ServiceNowError):
+        client(Timeout()).add_work_note(SYS_ID, "note")
+    assert Timeout.calls == 1
+
+
+def test_incident_that_already_has_an_ai_note_is_skipped():
+    sn = FakeSN({"number": "INC1", "short_description": "VPN fails",
+                 "work_notes": "2026-10-19 KB Assistant (Work notes)\n" + NOTE_HEADER + "\nSuggested..."})
+    assistant = FakeAssistant(answered())
+    assert process_incident(sn, assistant, SYS_ID)["outcome"] == "already_noted"
+    assert sn.notes == [] and assistant.questions == []

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 SYS_ID = re.compile(r"[0-9a-f]{32}")
 NUMBER = re.compile(r"[A-Z]{2,8}\d{4,12}")
-FIELDS = "sys_id,number,short_description,description,state,active"
+FIELDS = "sys_id,number,short_description,description,active,work_notes"
 MAX_DESCRIPTION = 700  # keep the question within the assistant's 1000-character limit
 
 NOTE_HEADER = "[AI Suggested Response - IT KB Assistant]"
@@ -72,15 +72,18 @@ class ServiceNowClient:
                 with self.opener(request, timeout=self.timeout) as response:
                     return json.loads(response.read().decode("utf-8") or "{}")
             except urllib.error.HTTPError as error:
-                if error.code in self.RETRY_STATUS and wait is not None:
+                # 429 means "not processed, slow down", so it's always safe to retry. Other errors
+                # and timeouts are retried only for reads: a write that timed out may have been saved
+                # (ServiceNow can be slow to answer), and a work-note PATCH or POST isn't idempotent.
+                retryable = error.code == 429 or (method == "GET" and error.code in self.RETRY_STATUS)
+                if retryable and wait is not None:
                     logger.warning("ServiceNow returned %s, retrying in %ss", error.code, wait)
                     self.sleep(wait)
                     continue
                 raise ServiceNowError(f"ServiceNow {method} {path.split('?')[0]} failed: HTTP {error.code}",
                                       error.code) from error
             except (OSError, ValueError, http.client.HTTPException) as error:  # timeouts, bad JSON
-                # A timed-out POST may still have created the record, so only retry safe methods.
-                if wait is not None and method in ("GET", "PATCH", "DELETE"):
+                if wait is not None and method == "GET":
                     self.sleep(wait)
                     continue
                 raise ServiceNowError(f"ServiceNow request failed: {type(error).__name__}") from error
@@ -109,7 +112,8 @@ class ServiceNowClient:
             raise ServiceNowError("invalid sys_id")
         try:
             data = self._request("GET", f"/api/now/table/incident/{sys_id}",
-                                 query={"sysparm_fields": FIELDS, "sysparm_exclude_reference_link": "true"})
+                                 query={"sysparm_fields": FIELDS, "sysparm_display_value": "true",
+                                        "sysparm_exclude_reference_link": "true"})
         except ServiceNowError as error:
             if error.status == 404:
                 return None
@@ -133,18 +137,24 @@ def incident_question(incident: dict) -> str:
     return short
 
 
+def _plain(text: str) -> str:
+    """Work notes are plain text in ServiceNow, so drop Markdown bold/italic markers."""
+    return re.sub(r"\*\*(.+?)\*\*", r"\1", text).replace("__", "")
+
+
 def format_work_note(result: dict) -> str:
     """Plain-text work note for the agent. Says clearly what the AI did and didn't find."""
     status = result.get("status")
     lines = [NOTE_HEADER]
     if status == "answered":
-        lines += ["Suggested resolution (from the knowledge base):", "", result.get("answer", "").strip(), "",
-                  "Sources:"]
-        lines += [f"[{s['n']}] {s['title']} ({s['source']})" for s in result.get("sources", [])]
-        scores = (result.get("guardrail", {}).get("output") or {}).get("scores") or {}
-        if scores:
-            checks = ", ".join(f"{k.lower()} {v:.2f}" for k, v in sorted(scores.items()))
-            lines += ["", f"Guardrail checks passed ({checks})."]
+        lines += ["Suggested resolution (from the knowledge base):", "", _plain(result.get("answer", "").strip()),
+                  "", "Sources:"]
+        by_doc = {}
+        for s in result.get("sources", []):  # several cited chunks can come from the same article
+            by_doc.setdefault((s["title"], s["source"]), []).append(s["n"])
+        lines += [f"{''.join(f'[{n}]' for n in nums)} {title} ({source})" for (title, source), nums in by_doc.items()]
+        if (result.get("guardrail", {}).get("output") or {}).get("scores"):
+            lines += ["", "Checked by Amazon Bedrock Guardrails: grounded in the cited articles and relevant."]
     elif status == "no_answer":
         lines += ["No knowledge base article covers this incident, so no answer is suggested.",
                   "Next step: troubleshoot as usual. If this issue repeats, consider writing a KB article."]
@@ -171,6 +181,9 @@ def process_incident(client: ServiceNowClient, assistant, sys_id: str, time_left
         return {"sys_id": sys_id, "outcome": "not_found"}
     if str(incident.get("active", "true")).lower() == "false":
         return {"sys_id": sys_id, "number": incident.get("number"), "outcome": "inactive"}
+    if NOTE_HEADER in str(incident.get("work_notes") or ""):
+        # Already noted (e.g. a write that timed out but was saved, then retried): never add a second note.
+        return {"sys_id": sys_id, "number": incident.get("number"), "outcome": "already_noted"}
     question = incident_question(incident)
     if not question:
         return {"sys_id": sys_id, "number": incident.get("number"), "outcome": "empty"}
