@@ -13,6 +13,8 @@ Also measures end-to-end time from creating the incident to the note appearing.
   python scripts/servicenow_eval.py --instance https://dev12345.service-now.com
   python scripts/servicenow_eval.py --instance ... --only answer --limit 5     # quick smoke test
   python scripts/servicenow_eval.py --instance ... --cleanup                  # delete eval incidents after
+  python scripts/servicenow_eval.py --instance ... --rescore evals/results/servicenow-<run>.json
+      # re-check a finished run: notes that arrived after the wait are scored, nothing new is created
 
 Uses the admin account (hidden prompt or SN_ADMIN_PASSWORD) to create incidents and read work notes.
 """
@@ -65,6 +67,30 @@ def find_note(sn: ServiceNowClient, sys_id: str) -> str | None:
     return None
 
 
+def print_summary(results: list, run_id: str, instance: str, times: list, path: str) -> None:
+    print("\nResults by type")
+    for kind in TYPES:
+        rows = [r for r in results if r["type"] == kind]
+        if rows:
+            print(f"  {kind:<10} {sum(r['pass'] for r in rows)}/{len(rows)}")
+    total = sum(r["pass"] for r in results)
+    noted = [r for r in results if r["status"] != "timeout"]
+    summary = {"run_id": run_id, "instance": instance.split("//")[-1].split(".")[0],
+               "passed": total, "total": len(results),
+               "pass_rate": round(total / len(results), 3) if results else 0,
+               "notes_received": len(noted),
+               "correct_when_noted": f"{sum(r['pass'] for r in noted)}/{len(noted)}",
+               "seconds_median": statistics.median(times) if times else None,
+               "seconds_max": max(times) if times else None}
+    print(f"  overall    {total}/{len(results)}  (notes received: {len(noted)}, correct among them: "
+          f"{summary['correct_when_noted']}; created -> note: median {summary['seconds_median']}s, "
+          f"max {summary['seconds_max']}s, polling every 3s)")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"summary": summary, "results": results}, f, indent=2)
+    print(f"Saved {os.path.relpath(path, ROOT)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--instance", required=True)
@@ -73,13 +99,34 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="max cases (0 = all)")
     parser.add_argument("--timeout", type=int, default=180, help="seconds to wait for each note")
     parser.add_argument("--cleanup", action="store_true", help="delete the eval incidents afterwards")
+    parser.add_argument("--rescore", metavar="RESULTS_JSON", help="re-check the incidents of an earlier run")
     args = parser.parse_args()
 
     password = os.environ.get("SN_ADMIN_PASSWORD") or getpass.getpass(f"ServiceNow {args.admin_user} password: ")
     sn = ServiceNowClient(args.instance, args.admin_user, password, timeout=60)
     with open(os.path.join(ROOT, "evals", "golden.jsonl")) as f:
-        cases = [json.loads(line) for line in f if line.strip()]
-    cases = [c for c in cases if c["type"] in TYPES and (not args.only or c["type"] == args.only)]
+        golden = {c["id"]: c for c in (json.loads(line) for line in f if line.strip())}
+
+    if args.rescore:
+        with open(args.rescore) as f:
+            earlier = json.load(f)
+        run_id = earlier["summary"]["run_id"]
+        results = []
+        for row in earlier["results"]:
+            if row["status"] == "timeout":
+                found = sn.query("incident", f"number={row['number']}", fields="sys_id", limit=1)
+                note = find_note(sn, found[0]["sys_id"]) if found else None
+                if note:
+                    status, sources = classify(note)
+                    row.update(status=status, sources=sources, seconds=None, late=True,
+                               **{"pass": score(golden[row["id"]], status, sources, note)})
+            results.append(row)
+            print(f"{'PASS' if row['pass'] else 'FAIL'}  {row['number']}  {row['id']:<28} {row['status']}")
+        times = [r["seconds"] for r in results if r.get("seconds") is not None]
+        print_summary(results, run_id, args.instance, times, os.path.splitext(args.rescore)[0] + "-rescored.json")
+        return
+
+    cases = [c for c in golden.values() if c["type"] in TYPES and (not args.only or c["type"] == args.only)]
     if args.limit:
         cases = cases[:args.limit]
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -116,29 +163,9 @@ def main():
         if pending:
             time.sleep(3)
 
-    print("\nResults by type")
-    for kind in TYPES:
-        rows = [r for r in results if r["type"] == kind]
-        if rows:
-            print(f"  {kind:<10} {sum(r['pass'] for r in rows)}/{len(rows)}")
-    total = sum(r["pass"] for r in results)
     times = [r["seconds"] for r in results if r["seconds"] is not None]
-    summary = {"run_id": run_id, "instance": args.instance.split("//")[-1].split(".")[0],
-               "passed": total, "total": len(results),
-               "pass_rate": round(total / len(results), 3) if results else 0,
-               "seconds_median": statistics.median(times) if times else None,
-               "seconds_max": max(times) if times else None}
-    print(f"  overall    {total}/{len(results)}  "
-          f"(incident created -> AI note: median {summary['seconds_median']}s, max {summary['seconds_max']}s; "
-          f"measured by polling every 3s)")
-
-    out_dir = os.path.join(ROOT, "evals", "results")
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"servicenow-{run_id}.json")
-    with open(path, "w") as f:
-        json.dump({"summary": summary, "results": results}, f, indent=2)
-    print(f"Saved {os.path.relpath(path, ROOT)}")
-
+    path = os.path.join(ROOT, "evals", "results", f"servicenow-{run_id}.json")
+    print_summary(results, run_id, args.instance, times, path)
     if args.cleanup:
         for incident in sn.query("incident", f"correlation_idSTARTSWITHkb-eval-{run_id}", fields="sys_id",
                                  limit=200):
