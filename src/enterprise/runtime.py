@@ -17,10 +17,11 @@ from .workflows import build_registry
 DEMO_CALLER = "alex.rivera"     # the public demo always acts as this fictional employee
 
 
-def caller_id(display_name: str) -> str:
-    """ServiceNow caller display name -> directory id ("Alex Rivera" -> "alex.rivera")."""
-    parts = re.findall(r"[a-z]+", str(display_name or "").lower())
-    return ".".join(parts[:2]) if len(parts) >= 2 else ""
+def caller_id(incident: dict) -> str:
+    """The caller's directory id: their ServiceNow user name, exactly (never guessed from a display name).
+    No user name -> "" (unknown caller: every account-scoped tool is refused)."""
+    value = str(incident.get("caller_id.user_name") or "").strip().lower()
+    return value if re.fullmatch(r"[a-z0-9._@-]{1,100}", value) else ""
 
 
 def build_toolkit(ticket: str, caller: str, store=None, backends=None, simulated_only=False, sleep=None) -> Toolkit:
@@ -53,7 +54,7 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
     pending = (store.get(f"pending#{ticket}") or {"ids": []})["ids"]
     if not pending:
         return {"outcome": "no_pending_approval"}
-    caller = caller_id(incident.get("caller_id"))
+    caller = caller_id(incident)
     kit = build_toolkit(ticket, caller, store=store, backends=backends)
     results = []
     for approval_id in pending:
@@ -63,7 +64,10 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
             results.append({"id": approval_id, "error": str(error)})
             continue
         if approved:
-            result = kit.run_approved(approval_id)
+            try:
+                result = kit.run_approved(approval_id)
+            except Exception as error:   # never strand the incident: report it as a failure
+                result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
             results.append({"id": approval_id, "tool": record["tool"], "ok": bool(result.get("ok")),
                             "error": result.get("error") or result.get("reason")})
         else:

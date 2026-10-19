@@ -104,6 +104,13 @@ def priority_number(value) -> int:
     return int(match.group(1)) if match else 5
 
 
+def safe_text(text: str) -> str:
+    """Model- or caller-influenced text going into a work note can't contain the markers the agent
+    relies on (so it can't make an escalation look like a fix waiting for confirmation)."""
+    return re.sub(r"Waiting for the caller to confirm|\[AI Agent - IT KB Assistant\]|Caller reply at",
+                  "[removed]", str(text or ""), flags=re.I)
+
+
 def plain(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"\1", str(text or "")).replace("__", "").strip()
 
@@ -154,12 +161,12 @@ ENTERPRISE_TOOLS = [
 
 
 class TicketAgent:
-    def __init__(self, llm, assistant, desk, max_steps: int = MAX_STEPS,
+    def __init__(self, llm, assistant, desk, max_steps: int | None = None,
                  min_step_seconds: float = MIN_SECONDS_PER_STEP, toolkit=None):
         self.llm = llm
         self.assistant = assistant
         self.desk = desk
-        self.max_steps = max_steps if toolkit is None else max(max_steps, ENTERPRISE_MAX_STEPS)
+        self.max_steps = max_steps or (ENTERPRISE_MAX_STEPS if toolkit else MAX_STEPS)
         self.min_step_seconds = min_step_seconds
         self.toolkit = toolkit   # enterprise.framework.Toolkit: the 12 workflows, authorized and audited
         self.system = SYSTEM_PROMPT + (ENTERPRISE_PROMPT if toolkit else "")
@@ -322,7 +329,7 @@ class TicketAgent:
 
     @staticmethod
     def _step_lines(state) -> list[str]:
-        return [f"- {s['tool']}: {s['detail']}" + (" [SIMULATED]" if s.get("simulated") else "")
+        return [f"- {s['tool']}: {safe_text(s['detail'])}" + (" [SIMULATED]" if s.get("simulated") else "")
                 for s in state["steps"]]
 
     def _similar(self, incident, question, state) -> dict:
@@ -391,7 +398,7 @@ class TicketAgent:
         tried = self._step_lines(state)
         related = state["similar"]["incidents"] if state["similar"] else []
         note = [AGENT_HEADER, f"Action: escalated to {team}" + (f", priority raised to {target}" if target < current else "")
-                + ".", "", "Why: " + (plain(reason) or "Not resolvable from the knowledge base."), "",
+                + ".", "", "Why: " + (safe_text(plain(reason)) or "Not resolvable from the knowledge base."), "",
                 "What the AI tried:", *tried]
         if related:
             note += ["", "Similar open incidents in the last hour (possible outage): "

@@ -58,6 +58,7 @@ class Tool:
                                          # a function (ctx, args) -> role or None when it depends on the request
     idempotent: bool = True              # safe to repeat if a call timed out
     precheck: Callable | None = None     # precheck(ctx, args) -> reason to deny, or ""
+    once_per_ticket: bool = False        # at most one execution per ticket, whatever the arguments
 
     def schema(self) -> dict:
         return {"name": self.name, "description": self.description,
@@ -185,7 +186,7 @@ class Policy:
     """Authorization layer. The model's arguments are data; identity and approvals come only from
     server-side state."""
 
-    def authorize(self, tool: Tool, args: dict, ctx: Context) -> Decision:
+    def authorize(self, tool: Tool, args: dict, ctx: Context, pre_approved: bool = False) -> Decision:
         if ctx.simulated_only and not tool.simulated:
             return Decision("deny", "the public demo only runs simulated tools")
         if tool.precheck:
@@ -195,11 +196,13 @@ class Policy:
         if tool.requires_identity and not ctx.identity_verified:
             return Decision("needs_identity", "verify the caller's identity first (verify_caller_identity)")
         role = tool.approval(ctx, args) if callable(tool.approval) else tool.approval
+        if role and pre_approved:
+            return Decision("allow", "approved (run_approved checked and used the approval)")
         if role:
             approval_id = args_key(tool.name, args, ctx.ticket)
             record = ctx.store.get(f"approval#{approval_id}")
             if record and record["status"] == "approved" and not record.get("consumed"):
-                return Decision("allow", f"approved by {record['decided_by']}", approval_id)
+                return Decision("deny", "already approved: approved actions run automatically, not by the agent")
             if record and record["status"] == "rejected":
                 return Decision("deny", f"rejected by {record['decided_by']}")
             if record and record.get("consumed"):
@@ -262,12 +265,22 @@ class Executor:
         self.waits = waits
 
     def run(self, tool: Tool, args: dict, ctx: Context) -> dict:
-        key = f"exec#{args_key(tool.name, args, ctx.ticket)}"
+        key = f"exec#{args_key(tool.name, {} if tool.once_per_ticket else args, ctx.ticket)}"
         if tool.risk != READ:
-            done = ctx.store.get(key)
-            if done:
+            # Claim the action before running it, so neither a redelivered message nor the model can run it
+            # twice; an action whose outcome is unknown (timeout, crash) is never run again automatically.
+            existing = ctx.store.get(key)
+            if existing and existing.get("ok"):
                 ctx.audit.record(ticket=ctx.ticket, action="duplicate_skipped", tool=tool.name, args=args)
-                return {**done, "duplicate": True}
+                ctx.caller_messages.extend(existing.get("messages", []))
+                return {**{k: v for k, v in existing.items() if k != "messages"}, "duplicate": True}
+            if existing and existing.get("status") in ("in_flight", "unknown_outcome"):
+                return self._failed(tool, args, ctx, "unknown_outcome",
+                                    "an earlier attempt of this action has an unknown outcome", 0)
+            claimed = ctx.store.put(key, {"status": "in_flight"}, if_absent=existing is None)
+            if not claimed:
+                return self._failed(tool, args, ctx, "unknown_outcome", "another run is executing this action", 0)
+        before = len(ctx.caller_messages)
         attempt = 0
         while True:
             attempt += 1
@@ -276,7 +289,7 @@ class Executor:
                 break
             except TransientError as error:
                 if attempt >= self.max_attempts:
-                    return self._failed(tool, args, ctx, "unavailable", str(error), attempt)
+                    return self._failed(tool, args, ctx, "unavailable", str(error), attempt, key)
                 ctx.audit.record(ticket=ctx.ticket, action="retry", tool=tool.name, attempt=attempt, error=str(error))
                 ctx.sleep(self.waits[min(attempt - 1, len(self.waits) - 1)])
             except ToolTimeout as error:
@@ -285,12 +298,15 @@ class Executor:
                     ctx.sleep(self.waits[min(attempt - 1, len(self.waits) - 1)])
                     continue
                 # A write that timed out may have happened: never blindly repeat it.
-                return self._failed(tool, args, ctx, "unknown_outcome", str(error), attempt)
+                return self._failed(tool, args, ctx, "unknown_outcome", str(error), attempt, key)
             except ToolError as error:
-                return self._failed(tool, args, ctx, "failed", str(error), attempt)
+                return self._failed(tool, args, ctx, "failed", str(error), attempt, key)
+            except Exception as error:  # a bug or unexpected input: for writes, the outcome is unknown
+                status = "failed" if tool.risk == READ else "unknown_outcome"
+                return self._failed(tool, args, ctx, status, f"unexpected error ({type(error).__name__})", attempt, key)
         result = {"ok": True, **result}
         if tool.risk != READ:
-            ctx.store.put(key, result)
+            ctx.store.put(key, {**result, "messages": ctx.caller_messages[before:]})
             ctx.executed.append({"tool": tool.name, "workflow": tool.workflow, "simulated": tool.simulated,
                                  "args": redact(args)})
         ctx.audit.record(ticket=ctx.ticket, action="executed", tool=tool.name, args=args, attempts=attempt,
@@ -298,10 +314,37 @@ class Executor:
         return result
 
     @staticmethod
-    def _failed(tool, args, ctx, status, error, attempts) -> dict:
+    def _failed(tool, args, ctx, status, error, attempts, key=None) -> dict:
+        if key and tool.risk != READ:
+            # "failed" means it definitely didn't happen and may be tried again later; "unknown_outcome" is final.
+            ctx.store.put(key, {"status": "unknown_outcome" if status == "unknown_outcome" else "failed"})
         ctx.audit.record(ticket=ctx.ticket, action=status, tool=tool.name, args=args, attempts=attempts, error=error)
         return {"ok": False, "status": status, "error": error, "escalate": True,
                 "note": "Do not retry this action. Escalate to a technician." if status == "unknown_outcome" else ""}
+
+
+def normalize(tool: Tool, args, ctx) -> tuple[dict | None, str]:
+    """Only the tool's own fields, as trimmed strings, with defaults filled in. Everything downstream
+    (policy, approval binding, idempotency, execution) sees this one canonical form."""
+    if not isinstance(args, dict):
+        return None, "arguments must be an object"
+    out = {}
+    for name in tool.properties:
+        value = args.get(name)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            return None, f"'{name}' must be a string"
+        value = " ".join(value.split())[:200]
+        if name in ("user", "employee"):
+            value = value.lower()
+        out[name] = value
+    if "user" in tool.properties and "user" not in out:
+        out["user"] = ctx.caller
+    missing = [name for name in tool.required if name not in out]
+    if missing:
+        return None, "missing required: " + ", ".join(missing)
+    return out, ""
 
 
 class Toolkit:
@@ -319,14 +362,21 @@ class Toolkit:
     def schemas(self) -> list[dict]:
         return self.registry.schemas()
 
-    def call(self, name: str, args: dict) -> dict:
+    def call(self, name: str, args: dict, approved_id: str = "") -> dict:
         tool = self.registry.get(name)
         if tool is None:
             return {"error": f"unknown tool {name}"}
-        decision = self.policy.authorize(tool, args, self.ctx)
-        self.ctx.audit.record(ticket=self.ctx.ticket, action="authorize", tool=name, args=args,
-                              decision=decision.outcome, reason=decision.reason)
         step = {"tool": name, "workflow": tool.workflow, "simulated": tool.simulated, "risk": tool.risk}
+        args, problem = normalize(tool, args, self.ctx)
+        if problem:
+            self.trace.append({**step, "result": "invalid", "detail": problem})
+            return {"ok": False, "invalid": True, "reason": problem}
+        try:
+            decision = self.policy.authorize(tool, args, self.ctx, pre_approved=bool(approved_id))
+        except Exception as error:   # never let a policy lookup crash the worker
+            decision = Decision("deny", f"authorization check failed ({type(error).__name__})")
+        self.ctx.audit.record(ticket=self.ctx.ticket, action="authorize", tool=name, args=args,
+                              decision=decision.outcome, reason=decision.reason, approval=approved_id)
         if decision.outcome == "deny":
             self.trace.append({**step, "result": "denied", "detail": decision.reason})
             return {"ok": False, "denied": True, "reason": decision.reason}
@@ -335,25 +385,30 @@ class Toolkit:
             return {"ok": False, "needs_identity": True, "reason": decision.reason}
         if decision.outcome == "needs_approval":
             record = self.approvals.request(decision.approval_id, tool, args, self.ctx)
+            if not record.get("approver"):
+                self.trace.append({**step, "result": "denied", "detail": "no authorized approver found"})
+                return {"ok": False, "denied": True, "reason": "no authorized approver exists for this request"}
             self.pending_approvals.append(record)
             self.trace.append({**step, "result": "approval requested",
-                               "detail": f"{record['role']}: {record.get('approver') or 'approver'}"})
+                               "detail": f"{record['role']}: {record.get('approver')}"})
             return {"ok": False, "approval_requested": True, "approver_role": record["role"],
                     "approver": record.get("approver"),
                     "note": "The action will run automatically once approved. Finish with request_approval."}
-        if decision.approval_id:
-            self.approvals.consume(decision.approval_id)
         result = self.executor.run(tool, args, self.ctx)
         self.trace.append({**step, "result": "ok" if result.get("ok") else result.get("status", "failed"),
                            "detail": result.get("summary") or result.get("error") or ""})
         return redact(result)
 
     def run_approved(self, approval_id: str) -> dict:
-        """Execute exactly the approved action (no model involved), once."""
+        """Execute exactly the approved action (no model involved), once: the approval is used up
+        before anything runs, even if the action is then denied or fails."""
         record = self.ctx.store.get(f"approval#{approval_id}")
         if not record or record["status"] != "approved":
             raise ToolError("not approved")
+        if record.get("consumed"):
+            raise ToolError("this approval was already used")
         if record["ticket"] != self.ctx.ticket or record["requested_by"] != self.ctx.caller:
             raise ToolError("approval belongs to a different ticket or caller")
+        self.approvals.consume(approval_id)
         self.ctx.identity_verified = bool(record.get("identity_verified"))
-        return self.call(record["tool"], record["args"])
+        return self.call(record["tool"], record["args"], approved_id=approval_id)

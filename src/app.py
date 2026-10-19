@@ -230,6 +230,13 @@ def servicenow_event(event, context):
         return _response(400, {"error": "'sys_id' must be a 32-character ServiceNow sys_id."})
     if kind not in ("new", "caller_reply", "approval") or (kind != "new" and not re.fullmatch(r"\d{1,10}", version)):
         return _response(400, {"error": "Unknown event."})
+    extra = {}
+    if kind == "approval":
+        # who decided and what, as signed by the Business Rule at the moment of the change
+        approver, decision = str(data.get("approver", "")), str(data.get("decision", ""))
+        if decision not in ("approved", "rejected") or not re.fullmatch(r"[\w.@-]{1,100}", approver):
+            return _response(400, {"error": "Invalid approval event."})
+        extra = {"approver": approver, "decision": decision, "version": version}
 
     # Each event is handled once: one agent run per new incident, one per caller reply or approval decision
     # (by record version).
@@ -248,7 +255,7 @@ def servicenow_event(event, context):
         return _response(503, {"error": "Temporarily unavailable."})
     try:
         _aws("sqs").send_message(QueueUrl=os.environ["SN_QUEUE_URL"],
-                                 MessageBody=json.dumps({"sys_id": sys_id, "number": number, "event": kind}))
+                                 MessageBody=json.dumps({"sys_id": sys_id, "number": number, "event": kind, **extra}))
     except Exception:
         logger.exception("Could not queue %s", number or sys_id)
         try:  # undo the claim so ServiceNow's retry (or a re-run) can succeed
@@ -277,7 +284,7 @@ def _desk(client: ServiceNowClient) -> ServiceNowDesk:
 
 
 def work_incident(client, assistant, sys_id: str, kind: str = "new", time_left=None,
-                  final_attempt: bool = True) -> dict:
+                  final_attempt: bool = True, event: dict | None = None) -> dict:
     """Agent mode. New incident: the agent sends a verified fix or escalates. Caller reply: resolve if
     the caller confirms, otherwise back to a technician."""
     incident = client.get_incident(sys_id)
@@ -290,10 +297,12 @@ def work_incident(client, assistant, sys_id: str, kind: str = "new", time_left=N
     desk = _desk(client)
     if kind == "approval":
         from enterprise.runtime import handle_approval_decision
-        decision = str(incident.get("approval") or "").lower()
-        if decision not in ("approved", "rejected") or not _enterprise_on():
+        event = event or {}
+        decision, approver = event.get("decision", ""), event.get("approver", "")
+        current = str(incident.get("approval") or "").lower()
+        # Act only on the signed decision, and only if the incident still shows it.
+        if decision not in ("approved", "rejected") or current != decision or not _enterprise_on():
             return {"sys_id": sys_id, "number": number, "kind": kind, "outcome": "ignored"}
-        approver = str(incident.get("sys_updated_by") or "")   # who set the Approval field, per ServiceNow
         return {"sys_id": sys_id, "number": number, "kind": kind,
                 **handle_approval_decision(desk, incident, approver, decision == "approved", _enterprise_store())}
     if kind == "caller_reply":
@@ -313,7 +322,7 @@ def work_incident(client, assistant, sys_id: str, kind: str = "new", time_left=N
     toolkit = None
     if _enterprise_on():
         from enterprise.runtime import build_toolkit, caller_id
-        toolkit = build_toolkit(str(number), caller_id(incident.get("caller_id")), store=_enterprise_store())
+        toolkit = build_toolkit(str(number), caller_id(incident), store=_enterprise_store())
     try:
         agent = TicketAgent(assistant.llm, assistant, desk, toolkit=toolkit)
         outcome = agent.run(incident, question, time_left=time_left, raise_on_model_error=not final_attempt)
@@ -343,7 +352,7 @@ def servicenow_worker(event, context):
             final = receives >= max_receives
             if os.environ.get("SN_MODE", "agent") == "agent":
                 summary = work_incident(_servicenow(), _assistant(), sys_id, kind, time_left=time_left,
-                                        final_attempt=final)
+                                        final_attempt=final, event=message)
                 logger.info(json.dumps({"event": "servicenow_agent", **summary}))
             elif kind == "new":
                 summary = process_incident(_servicenow(), _assistant(), sys_id, time_left=time_left,

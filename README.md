@@ -213,7 +213,12 @@ Nothing in this project changes a real account, device, or license.
 | 11 | Onboarding and offboarding | Simulated Entra ID / M365 / HR | Role-template checklist (account, groups, licenses, software, device), offboarding (disable, revoke, remove, free seats); resumes after a failed step | Manager requests, HR approval, identity | 2 |
 | 12 | Follow-up and resolution verification | **Real** ServiceNow | Caller confirms -> Resolved; anything else -> technician; approvals run the approved action and ask again | Caller only, once | 2 (+ agent tests) |
 
-Tests: `tests/test_enterprise.py` (42) and `tests/test_agent.py` (26), 163 in the suite. They cover
+Two independent code reviews (agent, then a security review of the enterprise framework) found
+issues that were fixed and now have regression tests, for example repeated resets via reworded
+arguments, a timed-out write retried by the model, approver taken from later edits, and HR records
+readable by anyone.
+
+Tests: `tests/test_enterprise.py` (48) and `tests/test_agent.py` (26), 169 in the suite. They cover
 success, permission denials, identity and approval gates, retries after throttling, timeouts (reads
 retried; writes never blindly repeated), duplicate requests (SQS redelivery), resumable lifecycle
 runs, escalation, and demo isolation. Not yet run live against ServiceNow: see "Outstanding" below.
@@ -246,17 +251,23 @@ flowchart LR
   server-side clients, and every call passes the policy first.
 - Identity comes from the server: `verify_caller_identity` sends an MFA push to the caller's registered
   device. The model can't mark anyone verified, and arguments like `identity_verified: true` are ignored.
+  The caller is the ServiceNow caller's exact user name, never guessed from a display name.
+- Arguments are normalized against each tool's schema (known fields only, strings, required fields
+  present) before policy, approval binding, idempotency, and execution all see the same canonical form.
 - Scope: account, mailbox, device, and log tools act only on the caller (the ServiceNow caller, not a
   name in the ticket text). Lifecycle changes must come from the employee's manager, never the employee.
-- Approvals are bound to the exact tool, arguments, ticket, and caller (a hash), are single-use, and can't
-  be approved by the requester or by anyone without the role (manager, group owner, HR). Approved actions
-  run in code, with no model involved.
+- Approvals are bound to the exact tool, arguments, ticket, and caller (a hash), are single-use (used up
+  before the action runs), and can't be approved by the requester or by anyone without the role (manager,
+  group owner, HR). The approver and decision are signed by the Business Rule at the moment of the
+  change, never inferred from later edits. Approved actions run in code: the model can't run them.
 - Credentials: temporary passwords are random (16 characters, all character classes), unique per reset,
   sent only through the secure channel, and never appear in tool results, tickets, logs, the audit
   trail, or the demo. Audit entries are redacted recursively.
 - Failure recovery: throttling is retried with backoff; a timed-out read is retried; a timed-out write is
-  never repeated ("unknown outcome", escalated); every write is keyed for idempotency, so SQS
-  redelivery can't double-execute; lifecycle runs checkpoint each step and resume.
+  never repeated, by the model or by a redelivery ("unknown outcome", escalated); every write is claimed
+  in DynamoDB before it runs, so SQS redelivery can't double-execute; a password reset runs at most once
+  per ticket; unexpected errors become a failed or unknown-outcome result instead of crashing the
+  worker; lifecycle runs checkpoint each step and resume.
 - The public demo runs the same agent with `simulated_only=True`, a fictional caller, in-memory state per
   request, and `DryRunDesk`: it can't reach ServiceNow or any real tool.
 
@@ -277,6 +288,8 @@ flowchart LR
 - Simulated backend state lives in memory per Lambda invocation (approved actions run against fresh
   simulated data). Approvals, idempotency keys, and lifecycle checkpoints are persisted in DynamoDB.
 - Not yet measured live in ServiceNow: the 12-workflow scenarios have unit and integration tests only.
+- Recommended in ServiceNow: an ACL so only approver roles can write an incident's Approval field, and
+  requiring opened_by = caller before sensitive actions.
 
 
 ## Public demo

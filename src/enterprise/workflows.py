@@ -84,7 +84,8 @@ def build_registry() -> Registry:
                 "delivered_to": out["delivered_to"], "force_change_at_next_sign_in": True}
     r.register(Tool("reset_password", 1, "Reset the caller's own password: a unique random temporary password is "
                     "sent to their registered phone (never shown here) and must be changed at next sign-in.",
-                    reset, USER, risk=SENSITIVE, requires_identity=True, precheck=_self_only, idempotent=False))
+                    reset, USER, risk=SENSITIVE, requires_identity=True, precheck=_self_only, idempotent=False,
+                    once_per_ticket=True))
 
     # ---------------------------------------------------------------- 2. Intune device diagnostics
     def devices(ctx, args):
@@ -245,8 +246,13 @@ def build_registry() -> Registry:
         if not record:
             raise ToolError("no HR record for that employee")
         return {**record, "summary": f"{record['type']} for {record['name']}"}
-    r.register(Tool("get_lifecycle_request", 11, "Look up the HR onboarding/offboarding record for an employee.",
-                    lifecycle_request, {"employee": {"type": "string"}}, ("employee",), risk=READ))
+    def record_manager(ctx, args):
+        record = ctx.backends.data["hr"].get(args.get("employee", ""))
+        return "" if record and record["manager"] == ctx.caller else "only the employee's manager can see this record"
+    r.register(Tool("get_lifecycle_request", 11, "Look up the HR onboarding/offboarding record for an employee "
+                    "(their manager only, identity verified).", lifecycle_request,
+                    {"employee": {"type": "string"}}, ("employee",), risk=READ, requires_identity=True,
+                    precheck=record_manager))
 
     def manager_of(ctx, args, kind):
         record = ctx.backends.data["hr"].get(args.get("employee", ""))

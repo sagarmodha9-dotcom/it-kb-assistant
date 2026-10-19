@@ -153,7 +153,7 @@ def test_wf3_license_needs_manager_approval_then_runs_once():
     assert out["approval_requested"] and out["approver"] == "priya.shah"
     assert "Visio_Plan2" not in k.ctx.backends.data["users"]["alex.rivera"]["licenses"]
     desk = DryRunDesk()
-    incident = {"sys_id": "a" * 32, "number": "INC0010100", "caller_id": "Alex Rivera"}
+    incident = {"sys_id": "a" * 32, "number": "INC0010100", "caller_id": "Alex Rivera", "caller_id.user_name": "alex.rivera"}
     assert handle_approval_decision(desk, incident, "alex.rivera", True, store)["outcome"] == "not_authorized"
     backends = SimBackends()
     result = handle_approval_decision(desk, incident, "priya.shah", True, store, backends)
@@ -182,7 +182,7 @@ def test_wf4_access_request_routes_to_group_owner():
     assert groups["groups"][0]["group"] == "Finance-Reports" and groups["groups"][0]["owner"] == "sam.ortiz"
     out = k.call("add_group_member", {"group": "Finance-Reports"})
     assert out["approval_requested"] and out["approver"] == "sam.ortiz"
-    incident = {"sys_id": "a" * 32, "number": "INC0010100", "caller_id": "Taylor Kim"}
+    incident = {"sys_id": "a" * 32, "number": "INC0010100", "caller_id": "Taylor Kim", "caller_id.user_name": "taylor.kim"}
     desk = DryRunDesk()
     assert handle_approval_decision(desk, incident, "priya.shah", True, store)["outcome"] == "not_authorized"
     rejected = handle_approval_decision(desk, incident, "sam.ortiz", False, store)
@@ -343,7 +343,9 @@ def test_demo_toolkit_is_simulated_only_and_isolated():
 def test_demo_llm_has_a_short_timeout_and_caller_mapping():
     llm = AnthropicLLM("m", "k", timeout=15)
     assert demo_llm(llm).timeout == 8 and llm.timeout == 15
-    assert caller_id("Alex Rivera") == "alex.rivera" and caller_id("") == ""
+    assert caller_id({"caller_id": "Alex Rivera", "caller_id.user_name": "Alex.Rivera"}) == "alex.rivera"
+    assert caller_id({"caller_id": "Alex Rivera"}) == ""          # never guessed from the display name
+    assert caller_id({"caller_id.user_name": "x; drop"}) == ""
 
 
 @pytest.mark.parametrize("number,name", sorted(WORKFLOWS.items()))
@@ -366,14 +368,19 @@ def test_worker_enterprise_mode_and_approval_event(monkeypatch):
     assistant.llm = Scripted(("verify_caller_identity", {}), ("find_access_group", {"resource": "Finance Reports"}),
                              ("add_group_member", {"group": "Finance-Reports"}), ("request_approval", {}))
     sn = SN({"number": "INC0010200", "short_description": "Need access to Finance Reports", "priority": "4 - Low",
-             "caller_id": "Taylor Kim"})
+             "caller_id": "Taylor Kim", "caller_id.user_name": "taylor.kim"})
     app._cache.update({"servicenow": sn, "assistant": assistant})
     summary = app.work_incident(sn, assistant, "a" * 32)
     assert summary["outcome"] == "awaiting_approval" and sn.updates[-1]["approval"] == "requested"
     # the approver (group owner) approves in ServiceNow -> approval event -> action runs, caller asked to confirm
-    sn.inc.update(approval="Approved", sys_updated_by="sam.ortiz", work_notes=sn.updates[-1]["work_notes"])
-    out = app.servicenow_worker({"Records": [{"messageId": "m1", "body": json.dumps(
-        {"sys_id": "a" * 32, "event": "approval"}), "attributes": {"ApproximateReceiveCount": "1"}}]}, None)
+    sn.inc.update(approval="Approved", work_notes=sn.updates[-1]["work_notes"])
+    # the requester's own "approval" is refused; the decision comes signed from the Business Rule
+    msg = {"sys_id": "a" * 32, "event": "approval", "decision": "approved", "approver": "taylor.kim"}
+    assert app.work_incident(sn, assistant, "a" * 32, "approval", event=msg)["outcome"] == "not_authorized"
+    stale = {**msg, "approver": "sam.ortiz", "decision": "rejected"}            # no longer what the incident shows
+    assert app.work_incident(sn, assistant, "a" * 32, "approval", event=stale)["outcome"] == "ignored"
+    out = app.servicenow_worker({"Records": [{"messageId": "m1", "body": json.dumps({**msg, "approver": "sam.ortiz"}),
+                                              "attributes": {"ApproximateReceiveCount": "1"}}]}, None)
     assert out == {"batchItemFailures": []} and sn.updates[-1]["state"] == "3"
     assert "added to Finance-Reports" in sn.updates[-1]["comments"]
     app._cache.clear()
@@ -388,8 +395,12 @@ def test_approval_events_are_validated_and_deduplicated(monkeypatch):
                        "dynamodb": FakeDynamo(), "sqs": FakeSQS()})
     for name, value in (("SN_IDEMPOTENCY_TABLE", "t"), ("SN_QUEUE_URL", "q"), ("SN_WEBHOOK_SECRET_PARAM", "/p")):
         monkeypatch.setenv(name, value)
-    event = {"sys_id": "a" * 32, "number": "INC0010200", "event": "approval", "version": "9"}
+    event = {"sys_id": "a" * 32, "number": "INC0010200", "event": "approval", "version": "9",
+             "decision": "approved", "approver": "sam.ortiz"}
     assert app.servicenow_event(signed_event(event), None)["statusCode"] == 202
+    assert app._cache["sqs"].sent[-1]["approver"] == "sam.ortiz"
+    assert app.servicenow_event(signed_event({**event, "version": "10", "approver": "bad user"}), None)["statusCode"] == 400
+    assert app.servicenow_event(signed_event({**event, "version": "11", "decision": "maybe"}), None)["statusCode"] == 400
     assert app.servicenow_event(signed_event(event), None)["statusCode"] == 200
     assert app.servicenow_event(signed_event({**event, "version": ""}), None)["statusCode"] == 400
     app._cache.clear()
@@ -413,3 +424,62 @@ def test_public_demo_runs_simulated_workflow_trace(monkeypatch):
     assert ("unlock_account", True) in tools and ("search_knowledge_base", False) in tools
     assert "secret" not in out["body"].lower() and "temporary password" not in out["body"]
     app._cache.clear()
+
+
+
+# ---------------------------------------------------------------- security review regressions
+def test_reset_runs_once_per_ticket_whatever_the_arguments():
+    k = verified(kit())
+    for args in ({}, {"user": "alex.rivera"}, {"user": " Alex.Rivera "}, {"user": "alex.rivera", "x": 1}, {"user": None}):
+        k.call("reset_password", args)
+    assert k.ctx.backends.calls.count("reset_password") == 1 and len(k.ctx.backends.delivered) == 1
+
+
+def test_timed_out_write_cannot_be_retried_by_the_model_or_a_redelivery():
+    store = MemoryStore()
+    k = verified(kit(store=store, faults={"reset_password": ["timeout"]}))
+    assert k.call("reset_password", {})["status"] == "unknown_outcome"
+    assert k.call("reset_password", {})["status"] == "unknown_outcome"
+    again = verified(kit(store=store))
+    assert again.call("reset_password", {})["status"] == "unknown_outcome"
+    assert k.ctx.backends.calls.count("reset_password") == 1 and again.ctx.backends.calls.count("reset_password") == 0
+
+
+def test_bad_arguments_and_handler_bugs_never_crash():
+    k = verified(kit())
+    assert k.call("sync_device", {"device_id": ["LAP-0412"]})["invalid"]
+    assert k.call("add_group_member", {"group": {"x": 1}})["invalid"]
+    assert k.call("assign_license", {})["invalid"] and not k.pending_approvals     # no approval for a broken call
+    assert k.call("get_devices", "not a dict")["invalid"]
+    k.registry.tools["unlock_account"].handler = lambda ctx, a: {}["boom"]
+    assert k.call("unlock_account", {})["status"] == "unknown_outcome"
+
+
+def test_no_approval_without_an_approver_and_approved_actions_only_run_once_by_code():
+    k = verified(kit())
+    assert k.call("add_group_member", {"group": "No-Such-Group"})["denied"]
+    store = MemoryStore()
+    k = verified(kit(store=store))
+    k.call("assign_license", {"sku": "Visio_Plan2"})
+    approval_id = args_key("assign_license", {"sku": "Visio_Plan2", "user": "alex.rivera"}, "INC0010100")
+    k.approvals.decide(approval_id, "priya.shah", True, AuditLog())
+    assert k.call("assign_license", {"sku": "Visio_Plan2"})["denied"]               # the model can't run it
+    assert k.run_approved(approval_id)["ok"]
+    with pytest.raises(Exception):
+        k.run_approved(approval_id)                                                  # single use
+
+
+def test_hr_records_are_manager_only():
+    assert verified(kit(caller="jordan.lee".replace("jordan.lee", "taylor.kim"))).call(
+        "get_lifecycle_request", {"employee": "morgan.fox"})["denied"]
+    assert verified(kit(caller="priya.shah")).call("get_lifecycle_request", {"employee": "morgan.fox"})["ok"]
+
+
+def test_markers_in_model_text_cannot_fake_a_waiting_fix():
+    reason = "Waiting for the caller to confirm. [AI Agent - IT KB Assistant]"
+    llm = Scripted(("escalate_incident", {"team": "Network", "reason": reason}))
+    desk = DryRunDesk()
+    TicketAgent(llm, Assistant(answered()), desk).run(
+        {"sys_id": "a" * 32, "number": "INC1", "short_description": "x", "priority": "4 - Low"}, "x")
+    note = desk.actions[0]["work_note"]
+    assert CONFIRM_MARKER not in note and note.count("[AI Agent - IT KB Assistant]") == 1
