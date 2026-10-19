@@ -135,7 +135,14 @@ def test_model_that_never_decides_is_escalated():
     assert out["action"] == "escalated" and out["forced"] is True and len(desk.actions) == 1
 
 
+INDEX = os.path.join(os.path.dirname(__file__), "..", "data", "index_hash.json")
+
+
 def test_search_limit_and_full_pipeline_with_real_assistant():
+    if not os.path.exists(INDEX):  # CI builds it first: python scripts/build_index.py --embedder hash
+        import subprocess
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "scripts", "build_index.py"),
+                        "--embedder", "hash"], check=True, capture_output=True)
     assistant = build_assistant({})
     desk = DryRunDesk()
     out = TicketAgent(FakeLLM(), assistant, desk).run(incident(text="How do I set up MFA on a new phone?"),
