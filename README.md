@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/sagarmodha9-dotcom/it-kb-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/sagarmodha9-dotcom/it-kb-assistant/actions/workflows/ci.yml)
 
+**Try it live: [it-kb-assistant-demo.streamlit.app](https://it-kb-assistant-demo.streamlit.app)** (no account needed; sample IT articles for a fictional company. If the app has been idle it may take ~30 seconds to wake up.)
+
 A chat assistant that answers employees' IT questions ("How do I set up MFA on my new phone?") from the
 company's own IT documents, cites the article it used, and says "I don't know" instead of guessing.
 When it can't help, one click opens a ticket in my [AI Ticket Triage API](https://github.com/sagarmodha9-dotcom/ai-ticket-triage),
@@ -152,6 +154,16 @@ the private integration above and built to be safe to leave running:
 The daily cap is the hard ceiling: worst case is 300 questions a day, and
 `scripts/demo_cost_report.py` reports the measured tokens and cost per question from the logs (and,
 with `--cost-explorer`, what AWS actually billed).
+
+### Launch results (Oct 19 2026)
+
+- `demo_security_check.py`: **11/11 checks passed** against the deployed API (keys rejected, demo key
+  locked out of `/ask` and `/escalate`, unsigned webhook rejected, 301 characters -> 413, citations
+  present, no internals returned, prompt injection blocked, 16th request from one visitor -> 429).
+- Measured with `demo_cost_report.py` over those checks: 15 questions, **$0.0158 in Claude tokens
+  (about $0.001 per question)**, average 1.8 s and p95 3.8 s per answer.
+- Tested from a logged-out browser: a grounded MFA answer with citations, and "not covered" for an
+  off-topic question.
 
 ### Launch checklist
 
