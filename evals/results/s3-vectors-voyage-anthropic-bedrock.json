@@ -1,0 +1,120 @@
+{
+  "config": {
+    "cases": "/Users/sagarmodha/Projects/it-kb-assistant/evals/golden.jsonl",
+    "retriever": "s3-vectors",
+    "embedder": "voyage",
+    "kb_id": "",
+    "vector_index_arn": "arn:aws:s3vectors:us-west-2:914249733722:bucket/it-kb-assistant-vectorbucket-in5dwvxeceqb/index/it-kb-assistant-chunkindex-c31zcaxbcu6n",
+    "llm": "anthropic",
+    "guardrail": "bedrock",
+    "guardrail_id": "2djny5r6rcuo",
+    "guardrail_version": "5",
+    "runs": 3,
+    "rerank_model": "",
+    "grounding_sweep": false,
+    "compare_keyword": true,
+    "min_pass_rate": 0.0,
+    "min_hit3": 0.0
+  },
+  "retrieval": {
+    "s3-vectors (voyage)": {
+      "direct": {
+        "n": 13,
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "mrr": 1.0
+      },
+      "all": {
+        "n": 26,
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "mrr": 1.0
+      },
+      "paraphrased": {
+        "n": 13,
+        "hit@1": 1.0,
+        "hit@3": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "keyword-bm25 (baseline)": {
+      "direct": {
+        "n": 13,
+        "hit@1": 0.9230769230769231,
+        "hit@3": 1.0,
+        "mrr": 0.9615384615384616
+      },
+      "all": {
+        "n": 26,
+        "hit@1": 0.7692307692307693,
+        "hit@3": 0.8846153846153846,
+        "mrr": 0.8269230769230769
+      },
+      "paraphrased": {
+        "n": 13,
+        "hit@1": 0.6153846153846154,
+        "hit@3": 0.7692307692307693,
+        "mrr": 0.6923076923076923
+      }
+    }
+  },
+  "end_to_end": {
+    "by_type": {
+      "answer": {
+        "passed": 75,
+        "total": 78
+      },
+      "no_answer": {
+        "passed": 15,
+        "total": 15
+      },
+      "blocked": {
+        "passed": 9,
+        "total": 9
+      },
+      "pii": {
+        "passed": 6,
+        "total": 6
+      },
+      "poisoned": {
+        "passed": 6,
+        "total": 6
+      },
+      "followup": {
+        "passed": 12,
+        "total": 12
+      }
+    },
+    "passed": 123,
+    "total": 126,
+    "pass_rate": 0.9761904761904762,
+    "avg_latency_ms": 3086,
+    "p95_latency_ms": 3573,
+    "avg_input_tokens": 633,
+    "avg_output_tokens": 107,
+    "est_model_cost_per_question_usd": 0.00117,
+    "failures": [
+      {
+        "run": 1,
+        "id": "teams-cant-hear",
+        "why": "status=no_answer",
+        "guardrail": "output grounding:RELEVANCE; GROUNDING=0.96 RELEVANCE=0.04",
+        "answer": "I found related articles but couldn't confirm an answer from them, so I don't want to guess. I can open a ticket so a technician can help."
+      },
+      {
+        "run": 2,
+        "id": "teams-cant-hear",
+        "why": "status=no_answer",
+        "guardrail": "output grounding:RELEVANCE; GROUNDING=0.96 RELEVANCE=0.04",
+        "answer": "I found related articles but couldn't confirm an answer from them, so I don't want to guess. I can open a ticket so a technician can help."
+      },
+      {
+        "run": 3,
+        "id": "teams-cant-hear",
+        "why": "status=no_answer",
+        "guardrail": "output grounding:RELEVANCE; GROUNDING=0.96 RELEVANCE=0.04",
+        "answer": "I found related articles but couldn't confirm an answer from them, so I don't want to guess. I can open a ticket so a technician can help."
+      }
+    ]
+  }
+}
