@@ -7,9 +7,10 @@ company's own IT documents, cites the article it used, and says "I don't know" i
 When it can't help, one click opens a ticket in my [AI Ticket Triage API](https://github.com/sagarmodha9-dotcom/ai-ticket-triage),
 which sets priority and alerts on outages.
 
-Built with **Amazon Bedrock Knowledge Bases** (Titan Text Embeddings V2 stored in **Amazon S3 Vectors**),
-**Bedrock Guardrails**, **Claude** (Bedrock with Anthropic API fallback), **AWS Lambda + API Gateway**
-(SAM), and a **Streamlit** web chat.
+Built with **Amazon S3 Vectors** (Voyage AI `voyage-4` embeddings), **Amazon Bedrock Guardrails**,
+**Claude** (Anthropic API, or Bedrock), **AWS Lambda + API Gateway** (SAM), and a **Streamlit** web chat.
+A managed **Bedrock Knowledge Base** (Titan embeddings, also on S3 Vectors) is deployed alongside and
+can be switched on with one parameter.
 
 ## Why
 
@@ -25,10 +26,10 @@ flowchart LR
     U[User / Streamlit chat] -->|POST /ask + x-api-key| API[API Gateway<br/>HTTP API, throttled]
     API --> L[Lambda: ask]
     L -->|1 ApplyGuardrail INPUT<br/>block topics + prompt attacks, mask PII| G[Bedrock Guardrails]
-    L -->|2 Retrieve top 5| KB[Bedrock Knowledge Base]
-    KB --- V[(S3 Vectors<br/>Titan V2 embeddings)]
-    S3[(S3: IT docs)] -->|ingestion: chunk + embed| KB
-    L -->|3 answer from sources only, JSON + citations| M[Claude<br/>Bedrock, fallback Anthropic API]
+    L -->|2a embed question| VO[Voyage AI<br/>voyage-4]
+    L -->|2b QueryVectors top 5| V[(Amazon S3 Vectors<br/>1024-dim cosine index)]
+    D[docs/*.md] -->|sync_vectors.py: chunk + embed + PutVectors| V
+    L -->|3 answer from sources only, JSON + citations| M[Claude<br/>Anthropic API or Bedrock]
     L -->|4 ApplyGuardrail OUTPUT<br/>contextual grounding + relevance| G
     U -->|POST /escalate| E[Lambda: escalate] -->|POST /tickets| T[AI Ticket Triage API]
 ```
@@ -40,7 +41,8 @@ For every question (`src/assistant.py`):
 1. **Input guardrail.** Blocks denied topics (help disabling security tools, sharing credentials) and
    prompt attacks. Masks PII (SSNs, card numbers, emails, phones, passwords) so it never reaches
    retrieval, the model, logs, or tickets.
-2. **Retrieve.** Vector search returns the 5 most similar chunks. Optionally, a **rerank** stage
+2. **Retrieve.** The question is embedded (Voyage `voyage-4`, query mode) and S3 Vectors returns the
+   5 nearest chunks by cosine distance, with their text stored as metadata. Optionally, a **rerank** stage
    (Cohere Rerank 3.5 on Bedrock) re-scores 15 candidates against the question and keeps the top 5.
 3. **Generate.** Claude answers *only* from those chunks and returns JSON:
    `{"answerable", "answer", "citations"}`. Documents are wrapped in `<documents>` and labeled as data,
@@ -82,13 +84,13 @@ that table.
 # Offline (CI): hash embeddings + rule-based fake model, catches pipeline regressions
 python evals/run_evals.py --compare-keyword
 
-# Real: Titan embeddings + Claude, local index, vs keyword baseline
-python evals/run_evals.py --retriever local --embedder titan --llm bedrock --compare-keyword --runs 3
-
-# Deployed: Bedrock Knowledge Base + Bedrock Guardrails
-python evals/run_evals.py --retriever bedrock-kb --kb-id <KnowledgeBaseId> \
+# Deployed retrieval: S3 Vectors + Voyage, Claude, Bedrock Guardrails (contextual grounding sweep)
+python evals/run_evals.py --retriever s3-vectors --embedder voyage --vector-index-arn <ChunkIndexArn> \
   --guardrail bedrock --guardrail-id <GuardrailId> --guardrail-version <GuardrailVersion> \
-  --llm bedrock --compare-keyword --grounding-sweep --runs 3
+  --llm anthropic --compare-keyword --grounding-sweep --runs 3
+
+# Managed alternative: Bedrock Knowledge Base (Titan)
+python evals/run_evals.py --retriever bedrock-kb --kb-id <KnowledgeBaseId> --llm bedrock ...
 
 # Add reranking (us-east-1: Cohere Rerank 3.5)
 python evals/run_evals.py ... --rerank-model arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0
@@ -104,8 +106,7 @@ python evals/run_evals.py ... --rerank-model arn:aws:bedrock:us-east-1::foundati
 | Guardrail | "How do I disable CrowdStrike so my games run faster?" | Blocked by Bedrock Guardrails (`topic:Security bypass`) in 290 ms; no retrieval or model call made |
 | Escalation + PII | "The whole 3rd floor lost Wi-Fi, my SSN is 123-45-6789" → `POST /escalate` | Ticket created in the AI Ticket Triage API, triaged **P1 / network**, SNS email alert sent; the stored ticket reads `my SSN is {US_SOCIAL_SECURITY_NUMBER}` (masked before it left this service) |
 
-**Retrieval and answer quality (Titan + Claude):** _pending. The eval suite is ready and runs as soon
-as Bedrock model quotas are enabled on the account._
+**Retrieval and answer quality:** _pending first real run._
 
 ## Run it locally
 
@@ -117,11 +118,12 @@ python -m pytest -q
 streamlit run ui/app.py                          # http://localhost:8501
 ```
 
-With real models (needs AWS credentials with Bedrock access):
+With real models (Voyage + Anthropic API keys):
 
 ```bash
-python scripts/build_index.py --embedder titan
-RETRIEVER=local EMBEDDER=titan INDEX_PATH=data/index_titan.json LLM_PROVIDER=bedrock \
+export VOYAGE_API_KEY=... ANTHROPIC_API_KEY=...
+python scripts/build_index.py --embedder voyage
+RETRIEVER=local EMBEDDER=voyage INDEX_PATH=data/index_voyage.json LLM_PROVIDER=anthropic \
   streamlit run ui/app.py
 ```
 
@@ -138,14 +140,16 @@ docker run -p 8501:8501 -e ASSISTANT_API_URL=<ApiUrl> -e ASSISTANT_API_KEY=<key>
 ```bash
 aws ssm put-parameter --name /it-kb-assistant/api-key --type SecureString \
   --value "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+aws ssm put-parameter --name /it-kb-assistant/voyage-api-key --type SecureString --value "<voyage key>"
 sam build && sam deploy --guided   # stack name it-kb-assistant; set TriageApiUrl to escalate tickets
-python scripts/sync_kb.py --stack it-kb-assistant   # upload docs + run ingestion
+python scripts/sync_vectors.py --stack it-kb-assistant --key-param /it-kb-assistant/voyage-api-key
+# optional managed path: python scripts/sync_kb.py, then redeploy with Retriever=bedrock-kb
 ```
 
 | Resource | Purpose |
 |---|---|
 | S3 bucket | Source documents (+ `.metadata.json` titles) |
-| S3 Vectors bucket + index | 1024-dim cosine index; chunk text stored as non-filterable metadata |
+| S3 Vectors bucket + 2 indexes | `ChunkIndex`: this project's Voyage embeddings (text as non-filterable metadata); second index backs the Bedrock KB |
 | Bedrock Knowledge Base + data source | Fixed-size 300-token chunks, 15% overlap, Titan Text Embeddings V2 |
 | Bedrock Guardrail + version | Content filters, prompt-attack filter, 2 denied topics, PII masking, contextual grounding |
 | 2 Lambdas + HTTP API | `/ask` and `/escalate`, x-api-key checked in constant time, 2 req/s throttle |
@@ -161,6 +165,10 @@ Guardrail text units.
 
 ## Design decisions
 
+- **Own embedding pipeline on S3 Vectors instead of only the managed Knowledge Base:** the project
+  chunks, embeds, writes, and queries vectors itself (`sync_vectors.py`, `S3VectorsRetriever`), so every
+  step of retrieval is visible and testable. The managed Bedrock Knowledge Base is kept as a switchable
+  alternative (`Retriever=bedrock-kb`).
 - **S3 Vectors over OpenSearch Serverless:** pay-per-use with no minimum capacity. Trade-off: semantic
   search only (no hybrid keyword + vector) and higher query latency, both fine at this scale.
 - **ApplyGuardrail instead of guardrailConfig on Converse:** one guardrail for every model provider,

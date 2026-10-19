@@ -47,6 +47,8 @@ def _assistant():
             except Exception:
                 logger.exception("No Anthropic key; using Bedrock only")
                 settings["LLM_PROVIDER"] = "bedrock"
+        if os.environ.get("EMBEDDER") == "voyage":
+            settings["VOYAGE_API_KEY"] = _ssm_secret(os.environ["VOYAGE_KEY_PARAM"])
         _cache["assistant"] = build_assistant(settings)
     return _cache["assistant"]
 
@@ -90,7 +92,12 @@ def ask(event, context):
     if error:
         return error
     time_left = (lambda: context.get_remaining_time_in_millis() / 1000 - 2) if context else None
-    result = _assistant().ask(data["question"], history=data.get("history"), time_left=time_left)
+    try:
+        assistant = _assistant()
+    except Exception:
+        logger.exception("Assistant setup failed")
+        return _response(503, {"error": "The assistant is not configured correctly. Please contact the Service Desk."})
+    result = assistant.ask(data["question"], history=data.get("history"), time_left=time_left)
     # One structured log line per question (no question text), easy to query in Logs Insights.
     logger.info(json.dumps({"event": "ask", "status": result["status"], "provider": result["provider"],
                             "sources": [s["source"] for s in result["sources"]],

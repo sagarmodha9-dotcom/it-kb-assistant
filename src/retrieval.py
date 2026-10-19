@@ -33,7 +33,12 @@ class LocalVectorRetriever:
 
     @classmethod
     def build(cls, chunks: list[dict], embedder):
-        embedded = [{**c, "embedding": embedder.embed(c["text"])} for c in chunks]
+        texts = [c["text"] for c in chunks]
+        if hasattr(embedder, "embed_documents"):  # batch API (Voyage): one request for all chunks
+            vectors = embedder.embed_documents(texts)
+        else:
+            vectors = [embedder.embed(t) for t in texts]
+        embedded = [{**c, "embedding": v} for c, v in zip(chunks, vectors)]
         return cls(embedded, embedder)
 
     def save(self, path: str) -> None:
@@ -119,6 +124,36 @@ class BedrockKBRetriever:
                 "section": "",
                 "score": round(float(item.get("score", 0.0)), 4),
             })
+        return results
+
+
+class S3VectorsRetriever:
+    """Vector search in Amazon S3 Vectors that this project manages itself: chunks are embedded
+    (scripts/sync_vectors.py) and stored with their text as metadata; a question is embedded with
+    the same model and the index returns the nearest chunks by cosine distance."""
+
+    name = "s3-vectors"
+
+    def __init__(self, index_arn: str, embedder, client=None):
+        self.index_arn = index_arn
+        self.embedder = embedder
+        if client is None:
+            import boto3
+            from botocore.config import Config
+            client = boto3.client("s3vectors",
+                                  config=Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 2}))
+        self.client = client
+
+    def search(self, query: str, k: int = 5) -> list[dict]:
+        response = self.client.query_vectors(
+            indexArn=self.index_arn, topK=k, queryVector={"float32": self.embedder.embed(query)},
+            returnMetadata=True, returnDistance=True)
+        results = []
+        for v in response.get("vectors", []):
+            meta = v.get("metadata") or {}
+            results.append({"text": str(meta.get("text", "")), "source": str(meta.get("source", "")),
+                            "title": str(meta.get("title", "")), "section": str(meta.get("section", "")),
+                            "score": round(1.0 - float(v.get("distance", 1.0)), 4)})  # cosine distance -> similarity
         return results
 
 

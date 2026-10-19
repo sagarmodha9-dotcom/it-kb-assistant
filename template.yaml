@@ -1,11 +1,22 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  IT Knowledge Base Assistant - RAG over IT docs with Amazon Bedrock Knowledge Bases (Titan
-  embeddings in Amazon S3 Vectors), Bedrock Guardrails, Claude, Lambda, and API Gateway.
+  IT Knowledge Base Assistant - RAG over IT docs: Voyage AI embeddings in Amazon S3 Vectors
+  (or a Bedrock Knowledge Base with Titan), Bedrock Guardrails, Claude, Lambda, and API Gateway.
   Questions it can't answer become tickets in the AI Ticket Triage API.
 
 Parameters:
+  Retriever:
+    Type: String
+    Description: >
+      s3-vectors = this project's own S3 Vectors index with Voyage embeddings (scripts/sync_vectors.py).
+      bedrock-kb = the managed Bedrock Knowledge Base with Titan embeddings (scripts/sync_kb.py).
+    Default: s3-vectors
+    AllowedValues: [s3-vectors, bedrock-kb]
+  VoyageKeyParam:
+    Type: String
+    Description: SSM SecureString holding the Voyage AI API key (s3-vectors retriever).
+    Default: /it-kb-assistant/voyage-api-key
   ModelId:
     Type: String
     Description: Bedrock model or inference profile ID used to write answers.
@@ -40,12 +51,16 @@ Parameters:
     Default: ""
   GroundingThreshold:
     Type: Number
-    Description: Answers scoring below this on contextual grounding are blocked (0 to 0.99).
-    Default: 0.7
+    Description: >
+      Answers scoring below this on contextual grounding are blocked (0 to 0.99). Set as a floor from
+      the eval sweep: at 0.7, 19% of correct answers were withheld and no wrong answers were caught.
+    Default: 0.1
   RelevanceThreshold:
     Type: Number
-    Description: Answers scoring below this on relevance to the question are blocked (0 to 0.99).
-    Default: 0.5
+    Description: >
+      Answers scoring below this on relevance to the question are blocked (0 to 0.99). Floor chosen
+      from the eval sweep: at 0.5, 19% of correct answers were withheld.
+    Default: 0.1
 
 Conditions:
   UseRerank: !Not [!Equals [!Ref RerankModelId, ""]]
@@ -95,6 +110,19 @@ Resources:
         NonFilterableMetadataKeys:
           - AMAZON_BEDROCK_TEXT
           - AMAZON_BEDROCK_METADATA
+
+  # The project's own index: Voyage voyage-4 embeddings (1024 dims). Chunk text is stored as
+  # non-filterable metadata so it can exceed the 2 KB filterable-metadata limit.
+  ChunkIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
 
   KnowledgeBaseRole:
     Type: AWS::IAM::Role
@@ -186,7 +214,7 @@ Resources:
             InputStrength: HIGH
             OutputStrength: NONE
           - Type: MISCONDUCT
-            InputStrength: MEDIUM
+            InputStrength: LOW      # MEDIUM flagged "Can I get admin rights?" as misconduct
             OutputStrength: MEDIUM
           - Type: HATE
             InputStrength: MEDIUM
@@ -205,13 +233,12 @@ Resources:
           - Name: Security bypass
             Type: DENY
             Definition: >-
-              Requests for help disabling, uninstalling, evading, or getting around security
-              controls such as antivirus or EDR software (CrowdStrike Falcon), MFA, firewalls,
-              disk encryption, or monitoring.
+              Requests to disable, uninstall, or bypass security software or protections so they
+              stop working, such as antivirus or EDR (CrowdStrike Falcon), MFA, or firewalls.
             Examples:
               - How do I turn off CrowdStrike so my computer runs faster?
-              - How can I get around MFA so I don't have to approve sign-ins?
-              - How do I disable BitLocker without IT knowing?
+              - How can I bypass MFA so it never asks me again?
+              - How do I disable the firewall so my game connects?
             InputEnabled: true
             InputAction: BLOCK
             OutputEnabled: false   # answers that *mention* security tools are fine
@@ -271,7 +298,9 @@ Resources:
     Type: AWS::Bedrock::GuardrailVersion
     Properties:
       GuardrailIdentifier: !GetAtt Guardrail.GuardrailId
-      Description: v1
+      # Changes to the guardrail's settings (including the thresholds) change this text, which
+      # makes CloudFormation publish a new version automatically.
+      Description: !Sub "v2 topics narrowed to intent; grounding ${GroundingThreshold}, relevance ${RelevanceThreshold}"
 
   # ---------- API ----------
   AssistantApi:
@@ -288,8 +317,11 @@ Resources:
       Description: Answer an IT question from the knowledge base with citations
       Environment:
         Variables:
-          RETRIEVER: bedrock-kb
+          RETRIEVER: !Ref Retriever
           KNOWLEDGE_BASE_ID: !GetAtt KnowledgeBase.KnowledgeBaseId
+          VECTOR_INDEX_ARN: !GetAtt ChunkIndex.IndexArn
+          EMBEDDER: voyage
+          VOYAGE_KEY_PARAM: !Ref VoyageKeyParam
           LLM_PROVIDER: !Ref LlmProvider
           MODEL_ID: !Ref ModelId
           ANTHROPIC_MODEL_ID: !Ref AnthropicModelId
@@ -304,6 +336,11 @@ Resources:
               Action: bedrock:Retrieve
               Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
             - Effect: Allow
+              Action:
+                - s3vectors:QueryVectors
+                - s3vectors:GetVectors   # needed to return metadata (the chunk text) with results
+              Resource: !GetAtt ChunkIndex.IndexArn
+            - Effect: Allow
               Action: bedrock:InvokeModel
               Resource:
                 - arn:aws:bedrock:*::foundation-model/anthropic.*
@@ -317,6 +354,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeyParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AnthropicKeyParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${VoyageKeyParam}
         - !If
           - UseRerank
           - Statement:
@@ -362,6 +400,8 @@ Resources:
 Outputs:
   ApiUrl:
     Value: !Sub https://${AssistantApi}.execute-api.${AWS::Region}.amazonaws.com
+  ChunkIndexArn:
+    Value: !GetAtt ChunkIndex.IndexArn
   DocsBucketName:
     Value: !Ref DocsBucket
   KnowledgeBaseId:

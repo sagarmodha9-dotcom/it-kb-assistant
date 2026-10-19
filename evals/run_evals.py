@@ -24,6 +24,8 @@ Options worth knowing:
 
 Examples:
   python evals/run_evals.py                                 # offline: hash embeddings + fake model
+  python evals/run_evals.py --retriever s3-vectors --embedder voyage --vector-index-arn <ChunkIndexArn> \
+      --llm anthropic --guardrail bedrock --guardrail-id <id> --guardrail-version 1 --compare-keyword --runs 3
   python evals/run_evals.py --retriever local --embedder titan --llm bedrock --compare-keyword --runs 3
   python evals/run_evals.py --retriever bedrock-kb --kb-id XXXX --guardrail bedrock \\
       --guardrail-id YYYY --guardrail-version 1 --llm bedrock --runs 3
@@ -107,9 +109,9 @@ class SweepGuardrail:
 
 
 def sweep_table(points: list[tuple[float, bool]]) -> list[dict]:
-    """points: (grounding score, answer was correct) for every answered case."""
+    """points: (score, answer was correct) for every answered case."""
     rows = []
-    for threshold in (0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9):
+    for threshold in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9):
         rows.append({"threshold": threshold,
                      "correct_blocked": sum(1 for s, ok in points if ok and s < threshold),
                      "wrong_caught": sum(1 for s, ok in points if not ok and s < threshold),
@@ -172,9 +174,10 @@ def grade(case: dict, result: dict, prompts: list[str]) -> tuple[bool, str]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", default=os.path.join(ROOT, "evals", "golden.jsonl"))
-    parser.add_argument("--retriever", default="local", choices=["local", "bedrock-kb", "keyword"])
-    parser.add_argument("--embedder", default="hash", choices=["hash", "titan"])
+    parser.add_argument("--retriever", default="local", choices=["local", "s3-vectors", "bedrock-kb", "keyword"])
+    parser.add_argument("--embedder", default="hash", choices=["hash", "titan", "voyage"])
     parser.add_argument("--kb-id", default="")
+    parser.add_argument("--vector-index-arn", default="", help="for --retriever s3-vectors")
     parser.add_argument("--llm", default="fake",
                         choices=["fake", "bedrock", "anthropic", "bedrock_with_anthropic_fallback"])
     parser.add_argument("--guardrail", default="local", choices=["local", "bedrock", "none"])
@@ -197,10 +200,15 @@ def main():
         "GUARDRAIL_ID": args.guardrail_id, "GUARDRAIL_VERSION": args.guardrail_version,
         "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
         "RERANK_MODEL_ARN": args.rerank_model,
+        "VECTOR_INDEX_ARN": args.vector_index_arn,
+        "VOYAGE_API_KEY": os.environ.get("VOYAGE_API_KEY", ""),
     }
     cases = load_cases(args.cases)
     retriever = build_retriever(settings)
-    label = f"{args.retriever}" + (f" ({args.embedder})" if args.retriever == "local" else "")
+    embedder = getattr(getattr(retriever, "inner", retriever), "embedder", None)
+    if hasattr(embedder, "embed_many"):  # embed every eval question in one batched request up front
+        embedder.embed_many([c["question"] for c in cases], "query")
+    label = f"{args.retriever}" + (f" ({args.embedder})" if args.retriever in ("local", "s3-vectors") else "")
     if args.rerank_model:
         label += " + rerank"
 
@@ -225,7 +233,7 @@ def main():
     failures, latencies, tokens_in, tokens_out = [], [], 0, 0
     base = build_assistant(settings, retriever=retriever)  # one model client + guardrail, reused
     guardrail = SweepGuardrail(base.guardrail) if args.grounding_sweep else base.guardrail
-    sweep_points = []
+    sweep_points = {"GROUNDING": [], "RELEVANCE": []}
     for run in range(args.runs):
         for case in cases:
             inner = retriever if case["type"] != "poisoned" else InjectingRetriever(retriever, case["injected"])
@@ -239,16 +247,25 @@ def main():
                 result = {"status": "crash", "answer": str(error), "sources": [], "offer_ticket": False,
                           "usage": {"input_tokens": 0, "output_tokens": 0}, "latency_ms": 0}
             ok, why = grade(case, result, llm.prompts)
-            if args.grounding_sweep and "GROUNDING" in guardrail.last_scores and result["status"] == "answered" \
-                    and case["type"] in ("answer", "pii", "followup"):
-                sweep_points.append((guardrail.last_scores["GROUNDING"], ok))
+            if args.grounding_sweep and result["status"] == "answered" and case["type"] in ("answer", "pii", "followup"):
+                for kind, score in guardrail.last_scores.items():
+                    sweep_points.setdefault(kind, []).append((score, ok))
             by_type[case["type"]][0] += ok
             by_type[case["type"]][1] += 1
             latencies.append(result.get("latency_ms", 0))
             tokens_in += result["usage"]["input_tokens"]
             tokens_out += result["usage"]["output_tokens"]
             if not ok:
-                failures.append({"run": run + 1, "id": case["id"], "why": why, "answer": result["answer"][:200]})
+                g = result.get("guardrail", {})
+                detail = []
+                if g.get("input", {}).get("reasons"):
+                    detail.append("input " + ",".join(g["input"]["reasons"]))
+                if g.get("output", {}).get("reasons"):
+                    detail.append("output " + ",".join(g["output"]["reasons"]))
+                if g.get("output", {}).get("scores"):
+                    detail.append(" ".join(f"{k}={v}" for k, v in g["output"]["scores"].items()))
+                failures.append({"run": run + 1, "id": case["id"], "why": why, "guardrail": "; ".join(detail),
+                                 "answer": result["answer"][:200]})
             if args.llm != "fake":
                 time.sleep(0.5)  # stay under low default Bedrock quotas
 
@@ -274,15 +291,17 @@ def main():
           f"avg tokens {e2e['avg_input_tokens']} in / {e2e['avg_output_tokens']} out, "
           f"~${e2e['est_model_cost_per_question_usd']}/question (model only)")
     for f in failures:
-        print(f"  FAIL run {f['run']} {f['id']}: {f['why']}")
+        print(f"  FAIL run {f['run']} {f['id']}: {f['why']}" + (f"  [{f['guardrail']}]" if f["guardrail"] else ""))
 
     if args.grounding_sweep:
-        report["grounding_sweep"] = sweep_table(sweep_points)
-        print("\nGROUNDING THRESHOLD SWEEP (answered cases; lower score = less supported by the sources)")
-        print(f"  {'threshold':>9}  {'correct answers blocked':>24}  {'wrong answers caught':>21}")
-        for row in report["grounding_sweep"]:
-            print(f"  {row['threshold']:>9}  {row['correct_blocked']:>12} of {row['correct_total']:<9}"
-                  f"  {row['wrong_caught']:>9} of {row['wrong_total']}")
+        report["grounding_sweep"] = {k: sweep_table(v) for k, v in sweep_points.items() if v}
+        for kind, rows in report["grounding_sweep"].items():
+            print(f"\n{kind} THRESHOLD SWEEP (answered cases; lower score = "
+                  + ("less supported by the sources)" if kind == "GROUNDING" else "less on-topic for the question)"))
+            print(f"  {'threshold':>9}  {'correct answers blocked':>24}  {'wrong answers caught':>21}")
+            for row in rows:
+                print(f"  {row['threshold']:>9}  {row['correct_blocked']:>12} of {row['correct_total']:<9}"
+                      f"  {row['wrong_caught']:>9} of {row['wrong_total']}")
 
     out = args.out or os.path.join(ROOT, "evals", "results",
                                    f"{args.retriever}-{args.embedder}-{args.llm}-{args.guardrail}.json")

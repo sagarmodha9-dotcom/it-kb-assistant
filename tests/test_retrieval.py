@@ -130,3 +130,69 @@ def test_reranker_reorders_wider_pool():
     cfg = client.kwargs["rerankingConfiguration"]["bedrockRerankingConfiguration"]
     assert cfg["numberOfResults"] == 2 and cfg["modelConfiguration"]["modelArn"] == "arn:rerank"
     assert len(client.kwargs["sources"]) == 10
+
+
+class VoyageOpener:
+    def __init__(self, fail_first=0, code=429):
+        self.requests, self.fail_first, self.code = [], fail_first, code
+
+    def __call__(self, request, timeout):
+        import urllib.error
+        body = json.loads(request.data)
+        self.requests.append((request, body))
+        if self.fail_first:
+            self.fail_first -= 1
+            raise urllib.error.HTTPError(request.full_url, self.code, "busy", {}, None)
+        data = [{"index": i, "embedding": [3.0, 4.0]} for i in range(len(body["input"]))]
+        return io.BytesIO(json.dumps({"data": data[::-1], "usage": {"total_tokens": 9}}).encode())
+
+
+def test_voyage_batches_caches_and_uses_input_types():
+    from embeddings import VoyageEmbedder
+    opener = VoyageOpener()
+    e = VoyageEmbedder("k", opener=opener, sleep=lambda s: None)
+    docs = e.embed_documents(["a", "b", "a"])
+    assert docs == [[0.6, 0.8]] * 3  # normalized
+    q = e.embed("a")
+    e.embed("a")
+    assert q == [0.6, 0.8] and len(opener.requests) == 2  # one batch for docs, one for the query, then cached
+    req, body = opener.requests[0]
+    assert body == {"input": ["a", "b"], "model": "voyage-4", "input_type": "document", "output_dimension": 1024}
+    assert req.get_header("Authorization") == "Bearer k"
+    assert opener.requests[1][1]["input_type"] == "query" and e.tokens_used == 18
+
+
+def test_voyage_retries_429_but_not_401():
+    import urllib.error
+    from embeddings import VoyageEmbedder
+    slept = []
+    e = VoyageEmbedder("k", opener=VoyageOpener(fail_first=2), sleep=slept.append)
+    e.embed("x")
+    assert slept == [2, 5]
+    with pytest.raises(urllib.error.HTTPError):
+        VoyageEmbedder("k", opener=VoyageOpener(fail_first=1, code=401), sleep=lambda s: None).embed("x")
+    with pytest.raises(ValueError):
+        VoyageEmbedder("")
+
+
+def test_voyage_splits_large_batches():
+    from embeddings import VoyageEmbedder
+    opener = VoyageOpener()
+    VoyageEmbedder("k", opener=opener).embed_documents([str(i) for i in range(300)])
+    assert [len(b["input"]) for _, b in opener.requests] == [128, 128, 44]
+
+
+def test_s3_vectors_retriever_maps_results():
+    from retrieval import S3VectorsRetriever
+
+    class Client:
+        def query_vectors(self, **kwargs):
+            self.kwargs = kwargs
+            return {"vectors": [{"key": "vpn#0", "distance": 0.25, "metadata": {
+                "text": "Use GlobalProtect.", "source": "vpn-troubleshooting.md", "title": "VPN", "section": "Connecting"}}]}
+    client = Client()
+    out = S3VectorsRetriever("arn:index", HashEmbedder(), client=client).search("vpn", 3)
+    assert client.kwargs["indexArn"] == "arn:index" and client.kwargs["topK"] == 3
+    assert client.kwargs["returnMetadata"] and len(client.kwargs["queryVector"]["float32"]) == 512
+    assert out == [{"text": "Use GlobalProtect.", "source": "vpn-troubleshooting.md", "title": "VPN",
+                    "section": "Connecting", "score": 0.75}]

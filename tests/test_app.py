@@ -101,3 +101,10 @@ def test_escalate_blocked_and_failure(monkeypatch):
             raise TicketError("not configured")
     monkeypatch.setattr(app, "TicketClient", Broken)
     assert app.escalate(event({"question": "printer jam"}), None)["statusCode"] == 502
+
+
+def test_setup_failure_is_503(monkeypatch):
+    monkeypatch.setenv("EMBEDDER", "voyage")
+    monkeypatch.setenv("VOYAGE_KEY_PARAM", "/x")
+    monkeypatch.setattr(app, "_ssm_secret", lambda name: (_ for _ in ()).throw(RuntimeError("missing")))
+    assert app.ask(event({"question": "vpn"}), None)["statusCode"] == 503

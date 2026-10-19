@@ -1,8 +1,10 @@
 """Build the assistant from settings, so Lambda, the web UI, and the evals all wire it the same way.
 
 Settings (environment variables or a dict):
-  RETRIEVER          bedrock-kb (needs KNOWLEDGE_BASE_ID) | local (needs INDEX_PATH) | keyword
-  EMBEDDER           titan | hash          (local retriever only; must match the index)
+  RETRIEVER          s3-vectors (needs VECTOR_INDEX_ARN) | bedrock-kb (needs KNOWLEDGE_BASE_ID)
+                     | local (needs INDEX_PATH) | keyword
+  EMBEDDER           voyage | titan | hash  (s3-vectors and local; must match what built the index)
+  VOYAGE_API_KEY
   GUARDRAIL          bedrock (needs GUARDRAIL_ID, GUARDRAIL_VERSION) | local | none
   LLM_PROVIDER       bedrock | anthropic | bedrock_with_anthropic_fallback | fake
   MODEL_ID, ANTHROPIC_MODEL_ID, ANTHROPIC_API_KEY
@@ -17,7 +19,8 @@ from documents import chunk_all, load_docs
 from embeddings import build_embedder
 from guardrails import BedrockGuardrail, LocalGuardrail, NoGuardrail
 from llm import build_llm
-from retrieval import BedrockKBRetriever, KeywordRetriever, LocalVectorRetriever, RerankingRetriever
+from retrieval import (BedrockKBRetriever, KeywordRetriever, LocalVectorRetriever, RerankingRetriever,
+                       S3VectorsRetriever)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS = {
@@ -48,8 +51,11 @@ def _base_retriever(settings: dict):
     kind = setting(settings, "RETRIEVER")
     if kind == "bedrock-kb":
         return BedrockKBRetriever(setting(settings, "KNOWLEDGE_BASE_ID"))
+    if kind == "s3-vectors":
+        return S3VectorsRetriever(setting(settings, "VECTOR_INDEX_ARN"),
+                                  build_embedder(setting(settings, "EMBEDDER"), setting(settings, "VOYAGE_API_KEY")))
     if kind == "local":
-        embedder = build_embedder(setting(settings, "EMBEDDER"))
+        embedder = build_embedder(setting(settings, "EMBEDDER"), setting(settings, "VOYAGE_API_KEY"))
         return LocalVectorRetriever.load(setting(settings, "INDEX_PATH"), embedder)
     if kind == "keyword":
         return KeywordRetriever(chunk_all(load_docs(setting(settings, "DOCS_DIR"))))

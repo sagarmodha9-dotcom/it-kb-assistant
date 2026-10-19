@@ -2,6 +2,7 @@
 
   python scripts/build_index.py --embedder hash    # offline, no AWS (used by tests and CI)
   python scripts/build_index.py --embedder titan   # real embeddings from Amazon Titan on Bedrock
+  python scripts/build_index.py --embedder voyage  # real embeddings from Voyage AI (VOYAGE_API_KEY)
 """
 import argparse
 import logging
@@ -19,7 +20,7 @@ from retrieval import LocalVectorRetriever  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--embedder", choices=["hash", "titan"], default="hash")
+    parser.add_argument("--embedder", choices=["hash", "titan", "voyage"], default="hash")
     parser.add_argument("--docs", default=os.path.join(ROOT, "docs"))
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
