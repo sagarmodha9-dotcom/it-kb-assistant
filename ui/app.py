@@ -124,6 +124,15 @@ sup.kb-cite { display: inline-flex; align-items: center; justify-content: center
 .kb-source .file { color: var(--muted); font-size: .78rem; margin-left: .4rem; font-weight: 400; }
 .kb-source q { color: var(--muted); font-size: .84rem; line-height: 1.5; quotes: "“" "”"; }
 
+.kb-agent { border-top: 1px solid var(--line); padding-top: .75rem; margin-top: .15rem; }
+.kb-agent-head { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .7rem; margin-bottom: .5rem; }
+.kb-agent-title { font-size: .8rem; font-weight: 600; color: var(--muted); }
+.kb-agent-decision { font-size: .9rem; font-weight: 600; color: var(--ink); }
+.kb-agent ol { margin: 0 0 .4rem; padding-left: 1.2rem; }
+.kb-agent li { font-size: .84rem; color: var(--muted); line-height: 1.5; margin: .1rem 0; }
+.kb-agent li b { color: var(--ink); font-weight: 500; }
+.kb-agent-foot { font-size: .78rem; color: var(--muted); }
+
 [data-testid="stSidebar"] { border-right: 1px solid var(--line); }
 [data-testid="stSidebar"] h3 { font-size: .95rem; font-weight: 600; margin-top: .6rem; }
 .kb-side p { color: var(--muted); font-size: .88rem; line-height: 1.55; }
@@ -270,6 +279,30 @@ def demo_text(text: str) -> str:
     return " ".join(kept) or text
 
 
+AGENT_STEP_NAMES = {"search_knowledge_base": "Searched the knowledge base",
+                    "find_similar_incidents": "Checked for similar incidents",
+                    "send_fix_to_caller": "Sent the fix to the caller",
+                    "escalate_incident": "Escalated"}
+
+
+def agent_html(plan: dict) -> str:
+    """What the ticket agent would do with this as a new ServiceNow incident (dry run in the demo)."""
+    if plan.get("action") == "awaiting_caller":
+        badge, decision = "ok", "Would send this fix to the caller and wait for them to confirm it worked"
+    else:
+        badge = "warn"
+        decision = f"Would escalate to the {html.escape(str(plan.get('team')))} team"
+        if plan.get("priority") and int(plan["priority"]) <= 2:
+            decision += f", priority {int(plan['priority'])} - High"
+    steps = "".join(f"<li><b>{html.escape(AGENT_STEP_NAMES.get(st_['tool'], st_['tool']))}</b>: "
+                    f"{html.escape(str(st_.get('detail', '')))}</li>" for st_ in plan.get("steps", []))
+    return (f'<div class="kb-agent"><div class="kb-agent-head"><span class="kb-agent-title">Ticket agent</span>'
+            f'<span class="kb-badge {badge}">{"Self-service" if badge == "ok" else "Escalate"}</span>'
+            f'<span class="kb-agent-decision">{decision}</span></div><ol>{steps}</ol>'
+            '<div class="kb-agent-foot">In the ServiceNow integration this runs on every new incident. '
+            "A ticket is resolved only after the caller confirms. Dry run: nothing is written in this demo.</div></div>")
+
+
 def show_turn(i: int, turn: dict) -> None:
     with st.chat_message("assistant", avatar=":material/support_agent:"):
         with st.container(key=f"answer-{i}"):
@@ -277,6 +310,8 @@ def show_turn(i: int, turn: dict) -> None:
             st.markdown(answer_markdown(demo_text(turn["answer"])), unsafe_allow_html=True)
             if turn.get("sources"):
                 st.markdown(sources_html(turn["sources"]), unsafe_allow_html=True)
+            if turn.get("agent"):
+                st.markdown(agent_html(turn["agent"]), unsafe_allow_html=True)
             if turn.get("ticket"):
                 ok, message = turn["ticket"]
                 (st.success if ok else st.error)(message)
@@ -293,6 +328,9 @@ st.markdown(CSS, unsafe_allow_html=True)
 intro = ("Ask an IT question in plain words. Answers come only from the company's IT articles, and each "
          "one shows the passages it used so you can check it. If the articles don't cover something, "
          "it says so instead of guessing.")
+if PUBLIC_DEMO:
+    intro += (" Each answer also shows what the AI ticket agent would do with it as a ServiceNow incident: "
+              "send the fix and wait for the caller to confirm, or escalate to the right team.")
 if not PUBLIC_DEMO:
     intro += " When it can't help, it can open a ticket."
 st.markdown(f'<div class="kb-head"><h1>IT Help Desk Assistant</h1><p>{intro}</p></div>', unsafe_allow_html=True)
@@ -312,8 +350,9 @@ with st.sidebar:
     if PUBLIC_DEMO:
         st.markdown("### About this demo")
         st.markdown('<div class="kb-side"><p>Retrieval-augmented generation over an IT knowledge base, '
-                    "running serverless on AWS. The same pipeline also writes AI work notes into "
-                    "ServiceNow incidents in the private deployment.</p></div>", unsafe_allow_html=True)
+                    "running serverless on AWS. In the private deployment, a ticket agent built on it works "
+                    "every new ServiceNow incident: it sends a verified fix and resolves only after the caller "
+                    "confirms, or escalates with a handoff note.</p></div>", unsafe_allow_html=True)
         stack = [("Model", "Claude Haiku 4.5"), ("Embeddings", "Voyage AI"), ("Vector store", "Amazon S3 Vectors"),
                  ("Safety", "Bedrock Guardrails"), ("Runtime", "AWS Lambda")]
         st.markdown('<ul class="kb-stack">' + "".join(f"<li><span>{k}</span><span>{v}</span></li>" for k, v in stack)

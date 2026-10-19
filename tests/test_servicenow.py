@@ -203,7 +203,7 @@ def signed_event(body, key=KEY, ts=None):
 def test_signed_event_is_queued_once(webhook):
     event = signed_event({"sys_id": SYS_ID, "number": "INC0010001"})
     assert app.servicenow_event(event, None)["statusCode"] == 202
-    assert webhook["sqs"].sent == [{"sys_id": SYS_ID, "number": "INC0010001"}]
+    assert webhook["sqs"].sent == [{"sys_id": SYS_ID, "number": "INC0010001", "event": "new"}]
     again = app.servicenow_event(signed_event({"sys_id": SYS_ID, "number": "INC0010001"}), None)
     assert again["statusCode"] == 200 and json.loads(again["body"])["status"] == "duplicate"
     assert len(webhook["sqs"].sent) == 1
@@ -252,6 +252,7 @@ def record(body, receives=1, message_id="m1"):
 
 
 def test_worker_notes_and_reports_only_failures(monkeypatch):
+    monkeypatch.setenv("SN_MODE", "suggest")
     app._cache.clear()
     sn = FakeSN({"number": "INC1", "short_description": "VPN fails"})
     app._cache.update({"servicenow": sn, "assistant": FakeAssistant(answered())})

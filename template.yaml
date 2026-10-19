@@ -70,8 +70,13 @@ Parameters:
     Default: ""
   ServiceNowUser:
     Type: String
-    Description: Least-privilege ServiceNow service account (itil role) used to read incidents and add work notes.
+    Description: Least-privilege ServiceNow service account (itil role) used to read and update incidents.
     Default: svc_kb_assistant
+  ServiceNowMode:
+    Type: String
+    AllowedValues: [agent, suggest]
+    Default: agent
+    Description: "agent: the AI sends a verified KB fix and waits for the caller to confirm, or escalates to a team. suggest: work-note suggestions only."
   ServiceNowPasswordParam:
     Type: String
     Description: SSM SecureString holding the service account's password.
@@ -483,7 +488,7 @@ Resources:
     Type: AWS::SQS::Queue
     Condition: UseServiceNow
     Properties:
-      VisibilityTimeout: 360            # 6x the worker timeout, as AWS recommends
+      VisibilityTimeout: 540            # 6x the worker timeout, as AWS recommends
       SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt ServiceNowDeadLetterQueue.Arn
@@ -545,14 +550,16 @@ Resources:
     Condition: UseServiceNow
     Properties:
       Handler: app.servicenow_worker
-      Description: Ask the knowledge base about a new incident and post an AI work note
-      Timeout: 60
+      Description: Ticket agent - send a verified KB fix and wait for the caller, or escalate (or suggest-only mode)
+      Timeout: 90
       Environment:
         Variables:
           SN_INSTANCE_URL: !Ref ServiceNowInstanceUrl
           SN_USER: !Ref ServiceNowUser
           SN_PASSWORD_PARAM: !Ref ServiceNowPasswordParam
           SN_MAX_RECEIVES: "3"
+          SN_MODE: !Ref ServiceNowMode
+          SN_CLOSE_CODE: Solution provided
       Policies:
         - !Ref AssistantRuntimePolicy
         - Statement:
@@ -629,6 +636,7 @@ Resources:
           DEMO_DAILY_CAP: !Ref DemoDailyCap
           DEMO_VISITOR_HOURLY_CAP: !Ref DemoVisitorHourlyCap
           DEMO_MAX_QUESTION: "300"
+          DEMO_AGENT: "true"   # also show the ticket agent's plan (dry run: writes nothing)
       Policies:
         - !Ref AssistantRuntimePolicy
         - Statement:

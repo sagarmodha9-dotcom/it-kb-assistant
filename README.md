@@ -61,10 +61,13 @@ protects the Anthropic API fallback too.
 
 ## ServiceNow integration
 
-Agents don't have to open the chat: when an incident is created in **ServiceNow**, the assistant
-reads it and adds a **work note** with a suggested resolution and the KB articles it came from.
-Work notes are internal, so only IT staff see them. **The AI only suggests:** it never changes the
-state, priority, or assignment, and never contacts the caller.
+When an incident is created in **ServiceNow**, an AI **ticket agent** works it (`ServiceNowMode=agent`,
+the default; details in [Ticket agent](#ticket-agent)): it sends the caller a verified fix from the
+knowledge base and **resolves only after the caller confirms it worked**, or escalates to the right
+team with a handoff note. `ServiceNowMode=suggest` is the original, more conservative mode: the AI only
+adds an internal **work note** with a suggested resolution and the KB articles it came from, and never
+changes state, priority, or assignment. The recording below and the results further down are from
+suggest mode.
 
 ![A new ServiceNow incident gets a cited AI work note from the KB Assistant](assets/servicenow-ai-work-note-demo.gif)
 
@@ -108,6 +111,47 @@ python scripts/servicenow_eval.py --instance https://devNNNNN.service-now.com
 ```
 
 A free ServiceNow **Personal Developer Instance** (developer.servicenow.com) is enough.
+
+### Ticket agent
+
+The agent turns the assistant from "suggests an answer" into "works the ticket", with a person in
+the loop wherever it matters. Claude decides which tools to call (tool use); the rules that matter are
+enforced in code, not left to the prompt (`src/agent.py`).
+
+```mermaid
+flowchart TD
+    N[New incident] --> S[Search the KB<br/>same RAG + Bedrock Guardrails as the chat]
+    S -->|input guardrail blocked| R1[Escalate to Service Desk<br/>agent never sees the text]
+    S --> F[Check similar incidents<br/>last 60 minutes]
+    F --> D{Claude decides}
+    D -->|verified KB answer, not urgent,<br/>no outage, not security| FIX[Send the fix to the caller<br/>On Hold - Awaiting Caller]
+    D -->|otherwise| ESC[Escalate: team, priority,<br/>handoff note]
+    FIX --> C{Caller replies}
+    C -->|it worked| RES[Resolved]
+    C -->|still broken / unclear| BACK[In Progress, Service Desk<br/>with the caller's reply]
+```
+
+| Rule | Enforced how |
+|---|---|
+| Only a verified fix goes to the caller | `send_fix_to_caller` takes a `search_id`, not text: the caller gets the knowledge base answer that passed the grounding check, never words the model wrote itself |
+| Resolved means the caller confirmed it | The agent never sets Resolved on its own. A second Business Rule sends the caller's reply; Claude classifies it, and only a clear "it worked" resolves the incident |
+| Urgent and outage incidents go to people | No self-service for priority 1-2, or when 3+ similar incidents arrived in the last hour (likely outage: escalated to the team with priority 2 and the related incident numbers) |
+| Security goes to Security | Clicked links, entered passwords, malware: escalated to Security with priority 2 even when a KB article exists |
+| Priority only goes up, at most to 2 | A person decides what is 1 - Critical |
+| Fixed list of teams | Service Desk, Network, Hardware, Software, Identity & Access, Security; anything else goes to the Service Desk |
+| No disruptive tools | The agent can't reset passwords, change permissions, or touch devices: its only write actions are send fix, escalate, and resolve-after-confirmation |
+| Blocked input never reaches the agent | Prompt injection, requests to bypass security, ID numbers: straight to the Service Desk for manual review |
+| Bounded | At most 5 model calls and 3 searches; if it doesn't decide, it escalates. Model down: SQS retries, and on the last try it escalates instead of guessing |
+| Stays out of a person's way | It only works new, unassigned incidents, and ignores a caller reply once a technician owns the ticket |
+| Audit trail | Every action writes a work note listing each step (searches, similar incidents, decision and why) |
+
+The public demo shows the same agent's decision for every question as a **dry run**: what it would
+do with that question as a new incident, with nothing written anywhere.
+
+Eval in agent mode: `python scripts/servicenow_eval.py --instance https://devNNNNN.service-now.com`
+scores the golden set by action (fix sent from the expected article, or escalated), plus 3 simultaneous
+VPN incidents that must be escalated as an outage, and two caller replies ("it worked" must resolve,
+"still broken" must go back to a technician).
 
 ### Results
 
@@ -374,9 +418,9 @@ Guardrail text units.
 
 ```
 docs/          12 IT knowledge base articles (Markdown)
-src/           assistant pipeline, retrievers, guardrails, models, ticket client, ServiceNow
-               connector, Lambda handlers
-servicenow/    Business Rule script and exported update set
+src/           assistant pipeline, retrievers, guardrails, models (incl. tool use), ticket agent
+               (agent.py), ticket client, ServiceNow connector, Lambda handlers
+servicenow/    Business Rule scripts (new incident, caller reply) and exported update set
 ui/app.py      Streamlit chat (local or deployed mode)
 evals/         golden set + eval runner
 scripts/       build_index.py, sync_vectors.py, sync_kb.py, ask.py,

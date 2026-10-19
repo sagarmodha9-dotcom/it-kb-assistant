@@ -9,10 +9,13 @@ Public recruiter demo (deployed only when PublicDemo=true):
 POST /demo/ask  {"question": "...", "history": [...]}    separate API key; answers only, no tickets or
                                                           ServiceNow; daily and per-visitor caps enforced here
 
-ServiceNow integration (see servicenow.py):
+ServiceNow integration (see servicenow.py and agent.py):
 POST /servicenow/events  {"sys_id": "...", "number": "INC0010001"}  called by a ServiceNow Business Rule
-                         and signed (x-timestamp + x-signature HMAC-SHA256) -> 202, queued
-SQS worker               fetches the incident, asks the assistant, writes an AI work note
+                         and signed (x-timestamp + x-signature HMAC-SHA256) -> 202, queued.
+                         {"event": "caller_reply", "version": "7", ...} when the caller answers a fix.
+SQS worker               SN_MODE=agent (default): the ticket agent sends a verified fix and waits for the
+                         caller, or escalates; on caller_reply it resolves only if the caller confirms.
+                         SN_MODE=suggest: posts a suggested-answer work note only.
 """
 import base64
 import hashlib
@@ -25,7 +28,10 @@ import time
 
 from assistant import MAX_QUESTION
 from factory import build_assistant, build_guardrail
-from servicenow import NUMBER, SYS_ID, RetryLater, ServiceNowClient, ServiceNowError, process_incident
+from agent import (AGENT_HEADER, AgentUnavailable, DryRunDesk, ServiceNowDesk, TicketAgent, agent_plan,
+                   handle_caller_reply)
+from servicenow import (NOTE_HEADER, NUMBER, SYS_ID, RetryLater, ServiceNowClient, ServiceNowError,
+                        incident_question, process_incident)
 from tickets import TicketClient, TicketError
 
 logger = logging.getLogger()
@@ -218,15 +224,20 @@ def servicenow_event(event, context):
         return _response(400, {"error": "Request body must be valid JSON."})
     sys_id = str(data.get("sys_id", ""))
     number = str(data.get("number", ""))
+    kind = str(data.get("event", "new"))
+    version = str(data.get("version", ""))
     if not SYS_ID.fullmatch(sys_id) or (number and not NUMBER.fullmatch(number)):
         return _response(400, {"error": "'sys_id' must be a 32-character ServiceNow sys_id."})
+    if kind not in ("new", "caller_reply") or (kind == "caller_reply" and not re.fullmatch(r"\d{1,10}", version)):
+        return _response(400, {"error": "Unknown event."})
 
-    # One AI note per incident: the first event for a sys_id wins, repeats are acknowledged and dropped.
+    # Each event is handled once: one agent run per new incident, one per caller reply (by record version).
+    key = sys_id if kind == "new" else f"{sys_id}#reply#{version}"
     table = os.environ["SN_IDEMPOTENCY_TABLE"]
     try:
         _aws("dynamodb").put_item(
             TableName=table,
-            Item={"sys_id": {"S": sys_id}, "number": {"S": number or "-"},
+            Item={"sys_id": {"S": key}, "number": {"S": number or "-"},
                   "expires_at": {"N": str(int(time.time()) + IDEMPOTENCY_DAYS * 86400)}},
             ConditionExpression="attribute_not_exists(sys_id)")
     except Exception as error:
@@ -236,16 +247,58 @@ def servicenow_event(event, context):
         return _response(503, {"error": "Temporarily unavailable."})
     try:
         _aws("sqs").send_message(QueueUrl=os.environ["SN_QUEUE_URL"],
-                                 MessageBody=json.dumps({"sys_id": sys_id, "number": number}))
+                                 MessageBody=json.dumps({"sys_id": sys_id, "number": number, "event": kind}))
     except Exception:
         logger.exception("Could not queue %s", number or sys_id)
         try:  # undo the claim so ServiceNow's retry (or a re-run) can succeed
-            _aws("dynamodb").delete_item(TableName=table, Key={"sys_id": {"S": sys_id}})
+            _aws("dynamodb").delete_item(TableName=table, Key={"sys_id": {"S": key}})
         except Exception:
             logger.exception("Could not release idempotency claim for %s", sys_id)
         return _response(503, {"error": "Temporarily unavailable."})
-    logger.info(json.dumps({"event": "servicenow_queued", "number": number}))
+    logger.info(json.dumps({"event": "servicenow_queued", "number": number, "kind": kind}))
     return _response(202, {"status": "queued", "number": number})
+
+
+def _desk(client: ServiceNowClient) -> ServiceNowDesk:
+    if "desk" not in _cache or _cache["desk"].client is not client:
+        _cache["desk"] = ServiceNowDesk(client, close_code=os.environ.get("SN_CLOSE_CODE", "Solution provided"))
+    return _cache["desk"]
+
+
+def work_incident(client, assistant, sys_id: str, kind: str = "new", time_left=None,
+                  final_attempt: bool = True) -> dict:
+    """Agent mode. New incident: the agent sends a verified fix or escalates. Caller reply: resolve if
+    the caller confirms, otherwise back to a technician."""
+    incident = client.get_incident(sys_id)
+    if incident is None:
+        return {"sys_id": sys_id, "outcome": "not_found"}
+    incident = {**incident, "sys_id": sys_id}  # the id we verified, not whatever the record echoes
+    number = incident.get("number")
+    if str(incident.get("active", "true")).lower() == "false":
+        return {"sys_id": sys_id, "number": number, "outcome": "inactive"}
+    desk = _desk(client)
+    if kind == "caller_reply":
+        try:
+            handled = handle_caller_reply(assistant.llm, assistant.guardrail, desk, incident, final_attempt)
+        except AgentUnavailable as error:
+            raise RetryLater(f"reply on {number}: {error}") from error
+        return {"sys_id": sys_id, "number": number, "kind": kind, **handled}
+    notes = str(incident.get("work_notes") or "")
+    if AGENT_HEADER in notes or NOTE_HEADER in notes:
+        return {"sys_id": sys_id, "number": number, "outcome": "already_handled"}
+    if str(incident.get("assigned_to") or "").strip():
+        return {"sys_id": sys_id, "number": number, "outcome": "technician_assigned"}
+    question = incident_question(incident)
+    if not question:
+        return {"sys_id": sys_id, "number": number, "outcome": "empty"}
+    try:
+        outcome = TicketAgent(assistant.llm, assistant, desk).run(
+            incident, question, time_left=time_left, raise_on_model_error=not final_attempt)
+    except AgentUnavailable as error:
+        raise RetryLater(f"agent unavailable on {number}: {error}") from error
+    return {"sys_id": sys_id, "number": number, "outcome": outcome["action"], "team": outcome.get("team"),
+            "priority": outcome.get("priority"), "steps": [s["tool"] for s in outcome["steps"]],
+            "provider": outcome.get("provider"), "usage": outcome.get("usage")}
 
 
 def servicenow_worker(event, context):
@@ -257,14 +310,21 @@ def servicenow_worker(event, context):
         try:
             message = json.loads(record["body"])
             sys_id = str(message["sys_id"])
+            kind = str(message.get("event", "new"))
         except (ValueError, KeyError, TypeError):
             logger.error("Dropping malformed message %s", record.get("messageId"))
             continue  # retrying a malformed message would never succeed
         receives = int(record.get("attributes", {}).get("ApproximateReceiveCount", "1"))
         try:
-            summary = process_incident(_servicenow(), _assistant(), sys_id, time_left=time_left,
-                                       final_attempt=receives >= max_receives)
-            logger.info(json.dumps({"event": "servicenow_note", **summary}))
+            final = receives >= max_receives
+            if os.environ.get("SN_MODE", "agent") == "agent":
+                summary = work_incident(_servicenow(), _assistant(), sys_id, kind, time_left=time_left,
+                                        final_attempt=final)
+                logger.info(json.dumps({"event": "servicenow_agent", **summary}))
+            elif kind == "new":
+                summary = process_incident(_servicenow(), _assistant(), sys_id, time_left=time_left,
+                                           final_attempt=final)
+                logger.info(json.dumps({"event": "servicenow_note", **summary}))
         except (RetryLater, ServiceNowError) as error:
             if getattr(error, "status", None) == 401:  # password rotated: read it again next time
                 _cache.pop("servicenow", None)
@@ -279,6 +339,8 @@ def servicenow_worker(event, context):
 
 # ---------------------------------------------------------------- public recruiter demo
 DEMO_MAX_HISTORY = 2
+DEMO_AGENT_MIN_SECONDS = 18   # skip the agent plan unless there's clearly time for it
+DEMO_AGENT_STEP_SECONDS = 17  # one model call can take up to 15 s
 
 
 def _demo_limit(name: str, default: int) -> int:
@@ -338,6 +400,7 @@ def demo_ask(event, context):
         logger.exception("Demo quota check failed")
         return _response(503, {"error": "The demo is temporarily unavailable."})
 
+    started = time.time()
     history = data.get("history") if isinstance(data.get("history"), list) else []
     time_left = (lambda: context.get_remaining_time_in_millis() / 1000 - 2) if context else None
     try:
@@ -347,8 +410,32 @@ def demo_ask(event, context):
         return _response(503, {"error": "The demo is temporarily unavailable."})
     result = assistant.ask(question, history=history[-DEMO_MAX_HISTORY:], time_left=time_left)
     result["offer_ticket"] = False  # no tickets, escalation, or ServiceNow writes in the public demo
+    plan = None
+    enough_time = time_left is None or time_left() > DEMO_AGENT_MIN_SECONDS
+    if result["status"] in ("answered", "no_answer", "blocked") and os.environ.get("DEMO_AGENT", "true") == "true" \
+            and enough_time:
+        # Show what the ticket agent would do with this as a new incident. DryRunDesk writes nothing.
+        try:
+            incident = {"sys_id": "0" * 32, "number": "DEMO", "short_description": result.get("question") or question,
+                        "priority": "4 - Low"}
+            # Each step needs time for one full model call (15 s client timeout), or the plan is skipped:
+            # the visitor always gets the answer, never a gateway timeout.
+            outcome = TicketAgent(assistant.llm, assistant, DryRunDesk(), max_steps=3,
+                                  min_step_seconds=DEMO_AGENT_STEP_SECONDS).run(
+                incident, incident["short_description"], time_left=time_left, prefetched=result,
+                raise_on_model_error=True)
+            plan = agent_plan(outcome)
+            for key in result["usage"]:
+                result["usage"][key] = outcome["usage"].get(key, 0)  # includes the prefetched search
+        except AgentUnavailable as error:
+            logger.warning("Demo agent plan skipped: %s", error)
+        except Exception:
+            logger.exception("Demo agent plan failed")
     logger.info(json.dumps({"event": "demo_ask", "status": result["status"], "provider": result["provider"],
                             "sources": [s["source"] for s in result["sources"]], "usage": result["usage"],
-                            "latency_ms": result["latency_ms"]}))
-    return _response(200, {k: result.get(k) for k in
-                           ("status", "answer", "sources", "offer_ticket", "guardrail", "latency_ms", "search_query")})
+                            "latency_ms": result.get("latency_ms"), "agent": (plan or {}).get("action")}))
+    body = {k: result.get(k) for k in
+            ("status", "answer", "sources", "offer_ticket", "guardrail", "latency_ms", "search_query")}
+    body["agent"] = plan
+    body["latency_ms"] = int((time.time() - started) * 1000)
+    return _response(200, body)

@@ -11,7 +11,10 @@ Flow (setup and results: README, "ServiceNow integration"):
      back as a work note. Work notes are internal: only IT staff see them, never the caller.
   4. Failures retry through SQS; after 3 tries the message goes to a dead-letter queue with an alarm.
 
-The AI only suggests. It never changes state, priority, or assignment, and never contacts the caller.
+In "suggest" mode (this module's process_incident) the AI only suggests: it never changes state,
+priority, or assignment, and never contacts the caller. In "agent" mode (agent.py, the default) the
+AI works the ticket: it sends a verified KB fix to the caller and waits for them to confirm, or
+escalates to the right team.
 """
 import base64
 import http.client
@@ -27,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 SYS_ID = re.compile(r"[0-9a-f]{32}")
 NUMBER = re.compile(r"[A-Z]{2,8}\d{4,12}")
-FIELDS = "sys_id,number,short_description,description,active,work_notes"
+FIELDS = ("sys_id,number,short_description,description,active,work_notes,comments,priority,state,"
+          "assigned_to,caller_id")
 MAX_DESCRIPTION = 700  # keep the question within the assistant's 1000-character limit
 
 NOTE_HEADER = "[AI Suggested Response - IT KB Assistant]"

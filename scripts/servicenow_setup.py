@@ -13,8 +13,10 @@ What it does:
   3. Generates a random HMAC signing key, saved to SSM and to a Private system property
      (private properties are never exported in update sets, so the key never lands in Git).
   4. Sets the webhook URL property from the stack output.
-  5. Creates the async Business Rule on the incident table (servicenow/business_rule.js).
-  6. Checks the service account can log in.
+  5. Creates the Business Rules on the incident table: new incident (servicenow/business_rule.js)
+     and caller reply (servicenow/business_rule_reply.js, for the agent's confirm-the-fix step).
+  6. Creates the assignment groups the agent escalates to, if they're missing.
+  7. Checks the service account can log in.
 
 The admin password is read with a hidden prompt (or SN_ADMIN_PASSWORD) and is never stored.
 """
@@ -28,11 +30,13 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
+from agent import TEAMS  # noqa: E402
 from servicenow import ServiceNowClient, ServiceNowError  # noqa: E402
 
 UPDATE_SET = "KB Assistant Integration"
 SERVICE_USER = "svc_kb_assistant"
 RULE_NAME = "KB Assistant - AI work note"  # sys_script names are limited to 40 characters
+REPLY_RULE_NAME = "KB Assistant - caller reply"
 
 
 def stack_output(stack: str, region: str, key: str) -> str:
@@ -117,12 +121,27 @@ def main():
     with open(os.path.join(ROOT, "servicenow", "business_rule.js")) as f:
         script = f.read()
     # STARTSWITH also finds a rule created under an older name, so re-runs update it instead of adding a second rule.
-    upsert(sn, "sys_script", "nameSTARTSWITHKB Assistant -",
+    upsert(sn, "sys_script", "nameSTARTSWITHKB Assistant - AI",
            {"name": RULE_NAME, "collection": "incident", "when": args.rule_when, "action_insert": "true",
             "active": "true", "advanced": "true", "order": "1000", "script": script,
-            "description": "Asks the IT KB Assistant (AWS) for a cited answer and adds it as a work note."})
+            "description": "Sends new incidents to the IT KB Assistant ticket agent (AWS)."})
+    with open(os.path.join(ROOT, "servicenow", "business_rule_reply.js")) as f:
+        reply_script = f.read()
+    upsert(sn, "sys_script", f"name={REPLY_RULE_NAME}",
+           {"name": REPLY_RULE_NAME, "collection": "incident", "when": "after", "action_update": "true",
+            "active": "true", "advanced": "true", "order": "1000", "script": reply_script,
+            "description": "When the caller replies to the AI agent's fix, lets the agent resolve or hand it back."})
+    upsert(sn, "sys_properties", "name=kb_assistant.service_user",
+           {"name": "kb_assistant.service_user", "value": SERVICE_USER, "type": "string",
+            "description": "The KB Assistant service account; its own comments never trigger the reply rule."})
 
-    print("6. Service account login check")
+    print("6. Assignment groups for escalation")
+    for team in TEAMS:
+        if not sn.query("sys_user_group", f"name={team}", fields="sys_id", limit=1):
+            sn.create("sys_user_group", {"name": team, "description": "Created for the KB Assistant ticket agent."})
+            print(f"   created {team}")
+
+    print("7. Service account login check")
     if not args.keep_secrets:
         try:
             ServiceNowClient(args.instance, SERVICE_USER, password).query("incident", fields="number", limit=1)
