@@ -66,6 +66,10 @@ def main():
     parser.add_argument("--region", default="us-west-2")
     parser.add_argument("--password-param", default="/it-kb-assistant/servicenow-password")
     parser.add_argument("--signing-key-param", default="/it-kb-assistant/servicenow-webhook-secret")
+    parser.add_argument("--rule-when", choices=["async_always", "after"], default="async_always",
+                        help="async_always (default): runs in the background job queue, so saving an incident "
+                             "never waits. after: runs right after the save, with a 5s timeout; use it when the "
+                             "instance's job queue is backlogged (common on brand-new developer instances)")
     parser.add_argument("--keep-secrets", action="store_true",
                         help="don't rotate the service account password and signing key")
     args = parser.parse_args()
@@ -112,8 +116,9 @@ def main():
     print("5. Business Rule")
     with open(os.path.join(ROOT, "servicenow", "business_rule.js")) as f:
         script = f.read()
-    upsert(sn, "sys_script", f"name={RULE_NAME}",
-           {"name": RULE_NAME, "collection": "incident", "when": "async", "action_insert": "true",
+    # STARTSWITH also finds a rule created under an older name, so re-runs update it instead of adding a second rule.
+    upsert(sn, "sys_script", "nameSTARTSWITHKB Assistant -",
+           {"name": RULE_NAME, "collection": "incident", "when": args.rule_when, "action_insert": "true",
             "active": "true", "advanced": "true", "order": "1000", "script": script,
             "description": "Asks the IT KB Assistant (AWS) for a cited answer and adds it as a work note."})
 

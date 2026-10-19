@@ -1,6 +1,8 @@
 /**
  * Business Rule: "KB Assistant - AI work note"
- * Table: incident | When: async (after insert, in the background, so agents never wait) | Insert: true
+ * Table: incident | Insert: true | When: async_always (background job queue, so saving never waits)
+ *   or after (runs right after the save; the webhook only queues and answers in under a second, and the
+ *   5-second timeout below caps the worst case). Use "after" if the instance's job queue is backlogged.
  *
  * Sends only the incident's sys_id and number to the AWS webhook. The worker then reads the incident
  * itself through the Table API, so no incident text travels in this request.
@@ -26,7 +28,7 @@
         var request = new sn_ws.RESTMessageV2();
         request.setEndpoint(endpoint);
         request.setHttpMethod('post');
-        request.setHttpTimeout(10000);
+        request.setHttpTimeout(5000);
         request.setRequestHeader('Content-Type', 'application/json');
         request.setRequestHeader('X-Timestamp', timestamp);
         request.setRequestHeader('X-Signature', signature);

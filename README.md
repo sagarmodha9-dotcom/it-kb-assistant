@@ -78,7 +78,7 @@ flowchart LR
 
 | Concern | How it's handled |
 |---|---|
-| Agents never wait | The Business Rule is **async**; the webhook only queues and returns `202` |
+| Agents never wait | The Business Rule runs **async** by default; the webhook only queues and returns `202`. On an instance whose background job queue is backlogged, `--rule-when after` runs it right after the save instead, with a 5-second cap |
 | Request authenticity | Each request is signed with **HMAC-SHA256** over `timestamp.body`; AWS rejects bad signatures and anything older than 5 minutes (no replays). The key is a **Private** system property, so it's never exported in the update set |
 | Least privilege | Dedicated `svc_kb_assistant` account: web-service access only, `itil` role, random password in SSM Parameter Store |
 | Untrusted input | The webhook carries only `sys_id` and number; the worker reads the incident from ServiceNow itself. Incident text goes through the same input guardrail (PII masking, denied topics, prompt-attack filter) as chat questions |
