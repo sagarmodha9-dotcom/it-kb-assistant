@@ -11,3 +11,6 @@ samconfig.toml
 # Streamlit agent skills (local symlinks)
 .agents/
 .claude/
+
+# Streamlit secrets stay local
+.streamlit/secrets.toml
