@@ -4,16 +4,24 @@ POST /ask       {"question": "...", "history": [...]}    -> cited answer, or an 
                 (history: optional last turns [{"question", "answer"}] for follow-up questions)
 POST /escalate  {"question": "...", "answer": "...",     -> opens a ticket in the AI Ticket Triage API
                  "sources": ["vpn-troubleshooting.md"]}
+
+ServiceNow integration (see servicenow.py):
+POST /servicenow/events  {"sys_id": "...", "number": "INC0010001"}  called by a ServiceNow Business Rule
+                         and signed (x-timestamp + x-signature HMAC-SHA256) -> 202, queued
+SQS worker               fetches the incident, asks the assistant, writes an AI work note
 """
 import base64
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import time
 
 from assistant import MAX_QUESTION
 from factory import build_assistant, build_guardrail
+from servicenow import NUMBER, SYS_ID, RetryLater, ServiceNowClient, ServiceNowError, process_incident
 from tickets import TicketClient, TicketError
 
 logger = logging.getLogger()
@@ -128,3 +136,138 @@ def escalate(event, context):
         return _response(502, {"error": "Could not create the ticket. Please contact the Service Desk."})
     logger.info(json.dumps({"event": "escalate", "ticket_id": ticket["ticket_id"], "priority": ticket["priority"]}))
     return _response(201, ticket)
+
+
+# ---------------------------------------------------------------- ServiceNow integration
+IDEMPOTENCY_DAYS = 7
+SIGNATURE_MAX_AGE = 300  # seconds
+
+
+def _secret(cache_key: str, env_name: str) -> str | None:
+    if cache_key not in _cache:
+        try:
+            _cache[cache_key] = _ssm_secret(os.environ[env_name])
+            _cache[cache_key + "_at"] = time.time()
+        except Exception:
+            logger.exception("Could not read %s", env_name)
+            return None
+    return _cache[cache_key]
+
+
+def _aws(service: str):
+    if service not in _cache:
+        import boto3
+        _cache[service] = boto3.client(service)
+    return _cache[service]
+
+
+def _servicenow() -> ServiceNowClient:
+    if "servicenow" not in _cache:
+        password = _secret("sn_password", "SN_PASSWORD_PARAM")
+        _cache["servicenow"] = ServiceNowClient(os.environ.get("SN_INSTANCE_URL", ""),
+                                                os.environ.get("SN_USER", ""), password or "")
+    return _cache["servicenow"]
+
+
+def _raw_body(event: dict) -> str:
+    body = event.get("body") or ""
+    return base64.b64decode(body).decode("utf-8") if event.get("isBase64Encoded") else body
+
+
+def verify_signature(secret_b64: str, timestamp: str, body: str, signature: str, now: float | None = None) -> bool:
+    """HMAC-SHA256 over "<timestamp>.<body>" with the shared key (base64). The timestamp must be
+    within 5 minutes, so a captured request can't be replayed later."""
+    try:
+        sent_at = int(timestamp)
+        key = base64.b64decode(secret_b64, validate=True)
+    except (TypeError, ValueError):
+        return False
+    if abs((now or time.time()) - sent_at) > SIGNATURE_MAX_AGE:
+        return False
+    expected = base64.b64encode(hmac.new(key, f"{timestamp}.{body}".encode("utf-8"), hashlib.sha256).digest())
+    return hmac.compare_digest(expected, (signature or "").encode())
+
+
+def servicenow_event(event, context):
+    """Webhook from the ServiceNow Business Rule. Fast: verify signature, de-duplicate, queue, 202."""
+    secret = _secret("sn_webhook_secret", "SN_WEBHOOK_SECRET_PARAM")
+    if secret is None:
+        return _response(503, {"error": "Webhook secret is not configured on the server."})
+    headers = event.get("headers") or {}
+    try:
+        body = _raw_body(event)
+    except (ValueError, UnicodeDecodeError):
+        return _response(400, {"error": "Request body must be valid JSON."})
+    signed = lambda key: verify_signature(key, headers.get("x-timestamp", ""), body,  # noqa: E731
+                                          headers.get("x-signature", ""))
+    if not signed(secret) and time.time() - _cache.get("sn_webhook_secret_at", 0) > 60:
+        # The key may have been rotated (servicenow_setup.py): re-read it, at most once a minute.
+        _cache.pop("sn_webhook_secret", None)
+        secret = _secret("sn_webhook_secret", "SN_WEBHOOK_SECRET_PARAM") or ""
+    if not secret or not signed(secret):
+        return _response(401, {"error": "Missing, invalid, or expired request signature."})
+    try:
+        data = json.loads(body or "{}")
+        if not isinstance(data, dict):
+            raise ValueError
+    except ValueError:
+        return _response(400, {"error": "Request body must be valid JSON."})
+    sys_id = str(data.get("sys_id", ""))
+    number = str(data.get("number", ""))
+    if not SYS_ID.fullmatch(sys_id) or (number and not NUMBER.fullmatch(number)):
+        return _response(400, {"error": "'sys_id' must be a 32-character ServiceNow sys_id."})
+
+    # One AI note per incident: the first event for a sys_id wins, repeats are acknowledged and dropped.
+    table = os.environ["SN_IDEMPOTENCY_TABLE"]
+    try:
+        _aws("dynamodb").put_item(
+            TableName=table,
+            Item={"sys_id": {"S": sys_id}, "number": {"S": number or "-"},
+                  "expires_at": {"N": str(int(time.time()) + IDEMPOTENCY_DAYS * 86400)}},
+            ConditionExpression="attribute_not_exists(sys_id)")
+    except Exception as error:
+        if getattr(error, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return _response(200, {"status": "duplicate", "number": number})
+        logger.exception("Idempotency check failed")
+        return _response(503, {"error": "Temporarily unavailable."})
+    try:
+        _aws("sqs").send_message(QueueUrl=os.environ["SN_QUEUE_URL"],
+                                 MessageBody=json.dumps({"sys_id": sys_id, "number": number}))
+    except Exception:
+        logger.exception("Could not queue %s", number or sys_id)
+        try:  # undo the claim so ServiceNow's retry (or a re-run) can succeed
+            _aws("dynamodb").delete_item(TableName=table, Key={"sys_id": {"S": sys_id}})
+        except Exception:
+            logger.exception("Could not release idempotency claim for %s", sys_id)
+        return _response(503, {"error": "Temporarily unavailable."})
+    logger.info(json.dumps({"event": "servicenow_queued", "number": number}))
+    return _response(202, {"status": "queued", "number": number})
+
+
+def servicenow_worker(event, context):
+    """SQS consumer. Reports per-message failures so only failed incidents are retried."""
+    max_receives = int(os.environ.get("SN_MAX_RECEIVES", "3"))
+    time_left = (lambda: context.get_remaining_time_in_millis() / 1000 - 3) if context else None
+    failures = []
+    for record in event.get("Records", []):
+        try:
+            message = json.loads(record["body"])
+            sys_id = str(message["sys_id"])
+        except (ValueError, KeyError, TypeError):
+            logger.error("Dropping malformed message %s", record.get("messageId"))
+            continue  # retrying a malformed message would never succeed
+        receives = int(record.get("attributes", {}).get("ApproximateReceiveCount", "1"))
+        try:
+            summary = process_incident(_servicenow(), _assistant(), sys_id, time_left=time_left,
+                                       final_attempt=receives >= max_receives)
+            logger.info(json.dumps({"event": "servicenow_note", **summary}))
+        except (RetryLater, ServiceNowError) as error:
+            if getattr(error, "status", None) == 401:  # password rotated: read it again next time
+                _cache.pop("servicenow", None)
+                _cache.pop("sn_password", None)
+            logger.warning("Will retry %s (attempt %s): %s", sys_id, receives, error)
+            failures.append({"itemIdentifier": record["messageId"]})
+        except Exception:
+            logger.exception("Unexpected error on %s (attempt %s)", sys_id, receives)
+            failures.append({"itemIdentifier": record["messageId"]})
+    return {"batchItemFailures": failures}

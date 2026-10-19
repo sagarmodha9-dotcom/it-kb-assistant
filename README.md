@@ -57,6 +57,54 @@ For every question (`src/assistant.py`):
 Guardrails run through the **ApplyGuardrail API**, separately from the model call, so the same guardrail
 protects the Anthropic API fallback too.
 
+## ServiceNow integration
+
+Agents don't have to open the chat: when an incident is created in **ServiceNow**, the assistant
+reads it and adds a **work note** with a suggested resolution and the KB articles it came from.
+Work notes are internal, so only IT staff see them. **The AI only suggests:** it never changes the
+state, priority, or assignment, and never contacts the caller.
+
+```mermaid
+flowchart LR
+    I[New incident] --> BR[Business Rule<br/>async, after insert]
+    BR -->|POST sys_id + number<br/>HMAC-SHA256 signed| W[Lambda: webhook<br/>verify, de-duplicate]
+    W -->|claim sys_id| DB[(DynamoDB<br/>one note per incident)]
+    W -->|queue| Q[SQS] --> K[Lambda: worker]
+    Q -.->|3 failed tries| DLQ[Dead-letter queue<br/>+ CloudWatch alarm]
+    K -->|read incident<br/>Table API, svc account| SN[(ServiceNow)]
+    K -->|ask| A[KB Assistant pipeline<br/>guardrails, retrieval, Claude]
+    K -->|PATCH work_notes| SN
+```
+
+| Concern | How it's handled |
+|---|---|
+| Agents never wait | The Business Rule is **async**; the webhook only queues and returns `202` |
+| Request authenticity | Each request is signed with **HMAC-SHA256** over `timestamp.body`; AWS rejects bad signatures and anything older than 5 minutes (no replays). The key is a **Private** system property, so it's never exported in the update set |
+| Least privilege | Dedicated `svc_kb_assistant` account: web-service access only, `itil` role, random password in SSM Parameter Store |
+| Untrusted input | The webhook carries only `sys_id` and number; the worker reads the incident from ServiceNow itself. Incident text goes through the same input guardrail (PII masking, denied topics, prompt-attack filter) as chat questions |
+| Duplicates | DynamoDB conditional write per `sys_id`: one AI note per incident, even if events repeat |
+| AI outage | SQS retries (only failed messages, via partial batch responses). Temporary failures never leave a note; on the last try the agent sees "AI unavailable", and the message goes to a dead-letter queue with an alarm. The incident works normally either way |
+| Burst of incidents | Worker concurrency capped at 2 to protect model quotas; the queue absorbs the rest |
+| Reproducible | `scripts/servicenow_setup.py` configures any instance idempotently; the config is captured in the **update set** `servicenow/update_set.xml` |
+
+### Set it up
+
+```bash
+# 1. Deploy (or update) the stack with the integration turned on
+sam build && sam deploy --parameter-overrides ServiceNowInstanceUrl=https://devNNNNN.service-now.com \
+  AlarmEmail=you@example.com   # plus your existing overrides
+# 2. Configure the instance: service account, signing key, properties, Business Rule, update set
+python scripts/servicenow_setup.py --instance https://devNNNNN.service-now.com
+# 3. Measure it end to end: creates incidents from the golden set, waits for each AI note, scores it
+python scripts/servicenow_eval.py --instance https://devNNNNN.service-now.com
+```
+
+A free ServiceNow **Personal Developer Instance** (developer.servicenow.com) is enough.
+
+### Results
+
+Results from the first live run will be added here.
+
 ## Evaluation
 
 `evals/golden.jsonl` has 42 cases, graded with deterministic checks (no LLM judge):
@@ -200,6 +248,7 @@ python scripts/sync_vectors.py --stack it-kb-assistant --key-param /it-kb-assist
 | Bedrock Knowledge Base + data source | Fixed-size 300-token chunks, 15% overlap, Titan Text Embeddings V2 |
 | Bedrock Guardrail + version | Content filters, prompt-attack filter, 2 denied topics, PII masking, contextual grounding |
 | 2 Lambdas + HTTP API | `/ask` and `/escalate`, x-api-key checked in constant time, 2 req/s throttle |
+| ServiceNow integration (optional) | Webhook + worker Lambdas, SQS queue + dead-letter queue + alarm, DynamoDB idempotency table; deployed only when `ServiceNowInstanceUrl` is set |
 | Optional rerank | `RerankModelId` parameter (e.g. `cohere.rerank-v3-5:0`); off by default |
 
 Each Lambda has its own IAM role: `ask` can only retrieve from this knowledge base, call Anthropic
@@ -237,9 +286,12 @@ Guardrail text units.
 
 ```
 docs/          12 IT knowledge base articles (Markdown)
-src/           assistant pipeline, retrievers, guardrails, models, ticket client, Lambda handlers
+src/           assistant pipeline, retrievers, guardrails, models, ticket client, ServiceNow
+               connector, Lambda handlers
+servicenow/    Business Rule script and exported update set
 ui/app.py      Streamlit chat (local or deployed mode)
 evals/         golden set + eval runner
-scripts/       build_index.py, sync_kb.py, ask.py
+scripts/       build_index.py, sync_vectors.py, sync_kb.py, ask.py,
+               servicenow_setup.py, servicenow_eval.py
 template.yaml  AWS SAM template
 ```

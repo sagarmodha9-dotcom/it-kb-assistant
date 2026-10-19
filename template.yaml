@@ -62,8 +62,35 @@ Parameters:
       from the eval sweep: at 0.5, 19% of correct answers were withheld.
     Default: 0.1
 
+  ServiceNowInstanceUrl:
+    Type: String
+    Description: >
+      ServiceNow instance, e.g. https://dev12345.service-now.com. Empty = the ServiceNow
+      integration (webhook, queue, worker) is not deployed.
+    Default: ""
+  ServiceNowUser:
+    Type: String
+    Description: Least-privilege ServiceNow service account (itil role) used to read incidents and add work notes.
+    Default: svc_kb_assistant
+  ServiceNowPasswordParam:
+    Type: String
+    Description: SSM SecureString holding the service account's password.
+    Default: /it-kb-assistant/servicenow-password
+  ServiceNowWebhookSecretParam:
+    Type: String
+    Description: SSM SecureString holding the base64 HMAC key ServiceNow uses to sign webhook requests (scripts/servicenow_setup.py creates it).
+    Default: /it-kb-assistant/servicenow-webhook-secret
+  AlarmEmail:
+    Type: String
+    Description: Optional email for the dead-letter-queue alarm (confirm the subscription email). Empty = no email.
+    Default: ""
+
 Conditions:
   UseRerank: !Not [!Equals [!Ref RerankModelId, ""]]
+  UseServiceNow: !Not [!Equals [!Ref ServiceNowInstanceUrl, ""]]
+  SendAlarmEmail: !And
+    - !Condition UseServiceNow
+    - !Not [!Equals [!Ref AlarmEmail, ""]]
 
 Globals:
   Function:
@@ -77,6 +104,20 @@ Globals:
         GUARDRAIL: bedrock
         GUARDRAIL_ID: !GetAtt Guardrail.GuardrailId
         GUARDRAIL_VERSION: !GetAtt GuardrailVersion.Version
+        # Assistant settings, shared by the /ask function and the ServiceNow worker
+        RETRIEVER: !Ref Retriever
+        KNOWLEDGE_BASE_ID: !GetAtt KnowledgeBase.KnowledgeBaseId
+        VECTOR_INDEX_ARN: !GetAtt ChunkIndex.IndexArn
+        EMBEDDER: voyage
+        VOYAGE_KEY_PARAM: !Ref VoyageKeyParam
+        LLM_PROVIDER: !Ref LlmProvider
+        MODEL_ID: !Ref ModelId
+        ANTHROPIC_MODEL_ID: !Ref AnthropicModelId
+        ANTHROPIC_KEY_PARAM: !Ref AnthropicKeyParam
+        RERANK_MODEL_ARN: !If
+          - UseRerank
+          - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${RerankModelId}
+          - ""
 
 Resources:
   # ---------- Knowledge base: docs in S3 -> chunks -> Titan embeddings -> S3 Vectors ----------
@@ -310,61 +351,59 @@ Resources:
         ThrottlingRateLimit: 2
         ThrottlingBurstLimit: 5
 
+  # Everything the assistant needs at runtime: retrieval, the model, the guardrail, and its API keys.
+  AssistantRuntimePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: bedrock:Retrieve
+            Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
+          - Effect: Allow
+            Action:
+              - s3vectors:QueryVectors
+              - s3vectors:GetVectors   # needed to return metadata (the chunk text) with results
+            Resource: !GetAtt ChunkIndex.IndexArn
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource:
+              - arn:aws:bedrock:*::foundation-model/anthropic.*
+              - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+              - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${ModelId}
+          - Effect: Allow
+            Action: bedrock:ApplyGuardrail
+            Resource: !GetAtt Guardrail.GuardrailArn
+          - Effect: Allow
+            Action: ssm:GetParameter
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AnthropicKeyParam}
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${VoyageKeyParam}
+          - !If
+            - UseRerank
+            - Effect: Allow
+              Action: bedrock:Rerank   # the Rerank API doesn't support resource-level permissions
+              Resource: "*"
+            - !Ref AWS::NoValue
+          - !If
+            - UseRerank
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${RerankModelId}
+            - !Ref AWS::NoValue
+
   AskFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: app.ask
       Description: Answer an IT question from the knowledge base with citations
-      Environment:
-        Variables:
-          RETRIEVER: !Ref Retriever
-          KNOWLEDGE_BASE_ID: !GetAtt KnowledgeBase.KnowledgeBaseId
-          VECTOR_INDEX_ARN: !GetAtt ChunkIndex.IndexArn
-          EMBEDDER: voyage
-          VOYAGE_KEY_PARAM: !Ref VoyageKeyParam
-          LLM_PROVIDER: !Ref LlmProvider
-          MODEL_ID: !Ref ModelId
-          ANTHROPIC_MODEL_ID: !Ref AnthropicModelId
-          ANTHROPIC_KEY_PARAM: !Ref AnthropicKeyParam
-          RERANK_MODEL_ARN: !If
-            - UseRerank
-            - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${RerankModelId}
-            - ""
       Policies:
+        - !Ref AssistantRuntimePolicy
         - Statement:
             - Effect: Allow
-              Action: bedrock:Retrieve
-              Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
-            - Effect: Allow
-              Action:
-                - s3vectors:QueryVectors
-                - s3vectors:GetVectors   # needed to return metadata (the chunk text) with results
-              Resource: !GetAtt ChunkIndex.IndexArn
-            - Effect: Allow
-              Action: bedrock:InvokeModel
-              Resource:
-                - arn:aws:bedrock:*::foundation-model/anthropic.*
-                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
-                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${ModelId}
-            - Effect: Allow
-              Action: bedrock:ApplyGuardrail
-              Resource: !GetAtt Guardrail.GuardrailArn
-            - Effect: Allow
               Action: ssm:GetParameter
-              Resource:
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeyParam}
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AnthropicKeyParam}
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${VoyageKeyParam}
-        - !If
-          - UseRerank
-          - Statement:
-              - Effect: Allow
-                Action: bedrock:Rerank   # the Rerank API doesn't support resource-level permissions
-                Resource: "*"
-              - Effect: Allow
-                Action: bedrock:InvokeModel
-                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${RerankModelId}
-          - !Ref AWS::NoValue
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeyParam}
       Events:
         Ask:
           Type: HttpApi
@@ -397,6 +436,132 @@ Resources:
             Path: /escalate
             Method: POST
 
+  # ---------- ServiceNow integration (deployed only when ServiceNowInstanceUrl is set) ----------
+  # Business Rule -> /servicenow/events (202) -> SQS -> worker -> AI work note on the incident.
+  ServiceNowDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Condition: UseServiceNow
+    Properties:
+      MessageRetentionPeriod: 1209600   # 14 days to investigate failures
+      SqsManagedSseEnabled: true
+
+  ServiceNowQueue:
+    Type: AWS::SQS::Queue
+    Condition: UseServiceNow
+    Properties:
+      VisibilityTimeout: 360            # 6x the worker timeout, as AWS recommends
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ServiceNowDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # One AI note per incident: the webhook claims each sys_id here before queueing it.
+  ServiceNowIdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Condition: UseServiceNow
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sys_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sys_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ServiceNowEventFunction:
+    Type: AWS::Serverless::Function
+    Condition: UseServiceNow
+    Properties:
+      Handler: app.servicenow_event
+      Description: Webhook for new ServiceNow incidents - verify signature, de-duplicate, queue
+      Timeout: 10
+      Environment:
+        Variables:
+          SN_WEBHOOK_SECRET_PARAM: !Ref ServiceNowWebhookSecretParam
+          SN_IDEMPOTENCY_TABLE: !Ref ServiceNowIdempotencyTable
+          SN_QUEUE_URL: !Ref ServiceNowQueue
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt ServiceNowIdempotencyTable.Arn
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt ServiceNowQueue.Arn
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ServiceNowWebhookSecretParam}
+      Events:
+        IncidentCreated:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AssistantApi
+            Path: /servicenow/events
+            Method: POST
+
+  ServiceNowWorkerFunction:
+    Type: AWS::Serverless::Function
+    Condition: UseServiceNow
+    Properties:
+      Handler: app.servicenow_worker
+      Description: Ask the knowledge base about a new incident and post an AI work note
+      Timeout: 60
+      Environment:
+        Variables:
+          SN_INSTANCE_URL: !Ref ServiceNowInstanceUrl
+          SN_USER: !Ref ServiceNowUser
+          SN_PASSWORD_PARAM: !Ref ServiceNowPasswordParam
+          SN_MAX_RECEIVES: "3"
+      Policies:
+        - !Ref AssistantRuntimePolicy
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ServiceNowPasswordParam}
+      Events:
+        Incidents:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ServiceNowQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 2   # protects model quotas during a burst of new incidents
+
+  ServiceNowAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: SendAlarmEmail
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  ServiceNowDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: UseServiceNow
+    Properties:
+      AlarmDescription: ServiceNow incidents failed 3 times and are waiting in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ServiceNowDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [SendAlarmEmail, [!Ref ServiceNowAlarmTopic], !Ref AWS::NoValue]
+
 Outputs:
   ApiUrl:
     Value: !Sub https://${AssistantApi}.execute-api.${AWS::Region}.amazonaws.com
@@ -412,3 +577,9 @@ Outputs:
     Value: !GetAtt Guardrail.GuardrailId
   GuardrailVersion:
     Value: !GetAtt GuardrailVersion.Version
+  ServiceNowWebhookUrl:
+    Condition: UseServiceNow
+    Value: !Sub https://${AssistantApi}.execute-api.${AWS::Region}.amazonaws.com/servicenow/events
+  ServiceNowDeadLetterQueueUrl:
+    Condition: UseServiceNow
+    Value: !Ref ServiceNowDeadLetterQueue
