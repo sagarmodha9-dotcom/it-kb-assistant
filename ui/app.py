@@ -233,9 +233,10 @@ def status_html(turn: dict) -> str:
     if status == "answered":
         n = len(turn.get("sources", []))
         parts.append(f'<span class="kb-badge ok">✓ Grounded in {n} cited article{"s" if n != 1 else ""}</span>')
-        scores = (turn.get("guardrail", {}).get("output") or {}).get("scores") or {}
-        if "GROUNDING" in scores:
-            parts.append(f"<span>Grounding score {scores['GROUNDING']:.2f}</span>")
+        if not PUBLIC_DEMO:
+            scores = (turn.get("guardrail", {}).get("output") or {}).get("scores") or {}
+            if "GROUNDING" in scores:
+                parts.append(f"<span>Grounding score {scores['GROUNDING']:.2f}</span>")
     elif status == "no_answer":
         parts.append('<span class="kb-badge warn">Not covered by the knowledge base</span>')
     elif status == "blocked":
@@ -261,11 +262,19 @@ def sources_html(sources: list) -> str:
     return f'<div class="kb-sources"><div class="kb-sources-title">Sources</div>{"".join(rows)}</div>'
 
 
+def demo_text(text: str) -> str:
+    """Tickets are off in the public demo, so drop any sentence offering one."""
+    if not PUBLIC_DEMO or "open a ticket" not in text.lower():
+        return text
+    kept = [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if "open a ticket" not in s.lower()]
+    return " ".join(kept) or text
+
+
 def show_turn(i: int, turn: dict) -> None:
     with st.chat_message("assistant", avatar=":material/support_agent:"):
         with st.container(key=f"answer-{i}"):
             st.markdown(status_html(turn), unsafe_allow_html=True)
-            st.markdown(answer_markdown(turn["answer"]), unsafe_allow_html=True)
+            st.markdown(answer_markdown(demo_text(turn["answer"])), unsafe_allow_html=True)
             if turn.get("sources"):
                 st.markdown(sources_html(turn["sources"]), unsafe_allow_html=True)
             if turn.get("ticket"):
