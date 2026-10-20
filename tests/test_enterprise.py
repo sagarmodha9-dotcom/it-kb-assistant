@@ -349,6 +349,43 @@ def test_simulated_evidence_never_closes_a_ticket_by_default():
     assert "SIMULATED" not in desk.actions[0]["close_notes"]
 
 
+def test_instant_resolve_needs_a_clean_non_security_run():
+    def run_it(script, text="locked out"):
+        desk = DryRunDesk()
+        out = TicketAgent(Scripted(*script), Assistant(NO_ANSWER), desk, toolkit=kit(), resolve_simulated=True).run(
+            {"sys_id": "a" * 32, "number": "INC1", "short_description": text, "priority": "4 - Low"}, text)
+        return out, desk
+    ok = (("verify_caller_identity", {}), ("unlock_account", {}))
+    out, desk = run_it(ok + (("complete_and_confirm", {}),), "I typed my password on a weird site and got locked out")
+    assert out["action"] == "awaiting_caller" and out["team"] == "Security" and desk.actions[0]["team"] == "Security"
+    # another write still waiting for an approver: the request isn't done, so nothing is closed
+    out, _ = run_it(ok + (("assign_license", {"sku": "Visio_Plan2"}), ("complete_and_confirm", {})))
+    assert out["action"] == "awaiting_caller"
+    # a write that failed alongside the verified one
+    out, desk = run_it(ok + (("reset_password", {"user": "priya.shah"}), ("complete_and_confirm", {})))
+    assert out["action"] == "awaiting_caller" and "Not closed automatically" in desk.actions[0]["work_note"]
+
+
+def test_approved_action_on_a_ticket_someone_took_over_is_not_closed():
+    store = MemoryStore()
+    k = verified(kit(caller="taylor.kim", store=store))
+    k.call("add_group_member", {"group": "Finance-Reports"})
+    incident = {"sys_id": "a" * 32, "number": "INC0010100", "caller_id": "Taylor Kim", "caller_id.user_name": "taylor.kim",
+                "assigned_to": "Beth Tech", "priority": "4 - Low"}
+    desk = DryRunDesk()
+    out = handle_approval_decision(desk, incident, "sam.ortiz", True, store, resolve_simulated=True)
+    assert out["outcome"] == "executed_awaiting_caller" and desk.actions[-1]["action"] == "send_fix"
+
+
+def test_a_reply_on_a_re_resolved_ticket_with_a_technician_is_left_alone():
+    incident = {"sys_id": "a" * 32, "state": "Resolved", "close_notes": RESOLVED_MARKER + ": verified fix",
+                "assigned_to": "Beth Tech", "caller_id": "Alex Rivera",
+                "comments": "2026-10-19 10:05:00 - Alex Rivera (Additional comments)\nbroken again"}
+    desk = DryRunDesk()
+    assert handle_caller_reply(FakeLLM(), build_guardrail({}), desk, incident)["outcome"] == "technician_assigned"
+    assert desk.actions == []
+
+
 def test_wf12_unverifiable_action_still_waits_for_the_caller():
     llm = Scripted(("get_devices", {}), ("sync_device", {"device_id": "LAP-0412"}), ("complete_and_confirm", {}))
     desk = DryRunDesk()

@@ -18,18 +18,19 @@ ServiceNow is the source of truth, so the job keeps no schedule of its own:
   - which strike: the number of "Follow-up reminder N of 2" work notes already on the ticket (work
     notes are internal, so a caller can't fake one);
   - each step is claimed in DynamoDB first, so two overlapping runs can't send the same reminder twice.
-Never closed this way: urgent incidents (priority 1-2 go to a technician at strike 3), tickets moved
+Never closed this way: urgent incidents and anything whose text looks like a security problem (handed
+to a technician instead of a first reminder), tickets moved
 to another team (Security, Network, ...), tickets linked to an outage, and anything a person is
-assigned to. Security incidents and outages never get here anyway: the agent escalates them instead of
-sending a fix. Closing is left to ServiceNow: the AI only sets Resolved, and the platform's usual
+assigned to. The agent normally escalates security incidents and outages instead of sending a fix;
+these checks are the backstop in code. Closing is left to ServiceNow: the AI only sets Resolved, and the platform's usual
 auto-close turns Resolved into Closed later, so the caller can still reopen in between.
 """
 import logging
 import re
 import time
 
-from agent import (AGENT_HEADER, AI_COMMENT_START, CONFIRM_MARKER, DEFAULT_TEAM, REOPEN_INVITE, RESOLVED_MARKER,
-                   latest_caller_reply, priority_number)
+from agent import (AGENT_HEADER, AI_COMMENT_START, CONFIRM_MARKER, DEFAULT_TEAM, REMINDER_START, REOPEN_INVITE,
+                   RESOLVED_MARKER, latest_caller_reply, looks_like_security, priority_number, with_service_desk)
 
 logger = logging.getLogger(__name__)
 
@@ -58,18 +59,24 @@ def _wait_text(hours: int) -> str:
 
 
 def _claim(store, key: str, now: float) -> bool:
+    """Claim one step for one ticket. A claim older than CLAIM_SECONDS (its write never landed) is taken
+    over with a compare-and-swap, so two runs can't both win it."""
     if store is None:
         return True
     existing = store.get(key)
-    if existing and now - float(existing.get("at", 0)) < CLAIM_SECONDS:
+    if existing is None:
+        return store.put(key, {"at": now}, if_absent=True)
+    if now - float(existing.get("at", 0)) < CLAIM_SECONDS:
         return False
-    return store.put(key, {"at": now}, if_absent=existing is None)
+    return store.replace_if(key, {"at": now}, existing)
 
 
 def follow_up(desk, incident: dict, store=None, wait_hours: int = FOLLOWUP_HOURS, now: float | None = None,
-              close_code: str = NO_RESPONSE_CLOSE_CODE) -> dict:
+              close_code: str = NO_RESPONSE_CLOSE_CODE, close_when_silent: bool = True,
+              still_current=None) -> dict:
     """One strike for one incident (fetched fresh from ServiceNow). Re-checks everything the query
-    selected on, because the ticket may have changed since."""
+    selected on, because the ticket may have changed since. `still_current()` is called right before the
+    write: if the ticket changed in between (say the caller just replied), nothing is written."""
     notes = str(incident.get("work_notes") or "")
     state = str(incident.get("state") or "").lower()
     if CONFIRM_MARKER not in notes:
@@ -78,8 +85,7 @@ def follow_up(desk, incident: dict, store=None, wait_hours: int = FOLLOWUP_HOURS
         return {"outcome": "not_waiting"}
     if str(incident.get("assigned_to") or "").strip():
         return {"outcome": "technician_assigned"}
-    group = str(incident.get("assignment_group") or "").strip()
-    if group and group != DEFAULT_TEAM:
+    if not with_service_desk(incident, desk):
         return {"outcome": "not_service_desk"}   # moved to Security, Network, ...: that team decides
     if str(incident.get("parent_incident") or "").strip():
         return {"outcome": "linked_to_outage"}   # part of an outage: closes with the parent, not on a timer
@@ -87,28 +93,43 @@ def follow_up(desk, incident: dict, store=None, wait_hours: int = FOLLOWUP_HOURS
         return {"outcome": "caller_replied"}     # the reply path handles it, not the timer
 
     sent = reminders_sent(notes)
-    step = f"reminder{sent + 1}" if sent < MAX_REMINDERS else "close"
+    urgent = priority_number(incident.get("priority")) <= 2
+    security = looks_like_security(incident)
+    step = "handoff" if urgent or security else f"reminder{sent + 1}" if sent < MAX_REMINDERS else "close"
     if not _claim(store, f"followup#{incident['sys_id']}#{step}", now or time.time()):
         return {"outcome": "in_progress"}
+    if still_current is not None and not still_current():
+        return {"outcome": "changed_meanwhile"}  # next run sees the new state (e.g. the caller's reply)
+
+    if urgent or security:
+        # Never on a timer: hand it to people as soon as the caller has gone quiet.
+        why = ("urgent (priority 1-2)" if urgent else "possibly a security incident (code check on the text)")
+        desk.back_to_technician(incident, "Security" if security else DEFAULT_TEAM, "\n".join([
+            AGENT_HEADER, f"No reply from the caller yet. This incident is {why}, so the AI doesn't send reminders "
+            "or close it: set back to In Progress for a technician."]))
+        return {"outcome": "security_to_technician" if security else "urgent_to_technician"}
 
     if sent < MAX_REMINDERS:
         n = sent + 1
         if n < MAX_REMINDERS:
             ask = ("Just checking in: did the fix we sent work? Please reply yes or no. If it's still not working, "
                    "tell us what's happening and a technician will take over.")
-        else:
+        elif close_when_silent:
             ask = (f"Last reminder: did the fix work? If we don't hear back within {_wait_text(wait_hours)}, we'll "
                    "close this ticket. You can reply any time to reopen it.")
-        desk.remind(incident, comment=f"{AI_COMMENT_START}. {ask}", work_note="\n".join([
+        else:
+            ask = ("Last reminder: did the fix work? If we don't hear back, a technician will review your ticket "
+                   "before it's closed.")
+        desk.remind(incident, comment=f"{REMINDER_START}. {ask}", work_note="\n".join([
             AGENT_HEADER, f"Follow-up reminder {n} of {MAX_REMINDERS} sent to the caller (no reply yet).",
             CONFIRM_MARKER + "."]))
         return {"outcome": f"reminder_{n}"}
 
-    if priority_number(incident.get("priority")) <= 2:
+    if not close_when_silent:
         desk.back_to_technician(incident, DEFAULT_TEAM, "\n".join([
-            AGENT_HEADER, f"No reply from the caller after {MAX_REMINDERS} reminders. This incident is urgent "
-            "(priority 1-2), so the AI doesn't close it: set back to In Progress for a technician."]))
-        return {"outcome": "urgent_to_technician"}
+            AGENT_HEADER, f"No reply from the caller after {MAX_REMINDERS} reminders. Closing on no response is "
+            "turned off (ServiceNowNoResponseClose=false): review before closing."]))
+        return {"outcome": "no_response_to_technician"}
     desk.resolve(incident,
                  comment=f"{AI_COMMENT_START}. We haven't heard back, so we've resolved this ticket. {REOPEN_INVITE}",
                  work_note="\n".join([
@@ -123,7 +144,7 @@ def follow_up(desk, incident: dict, store=None, wait_hours: int = FOLLOWUP_HOURS
 
 
 def run_followups(client, desk, store, service_user: str, min_minutes: int, wait_hours: int = FOLLOWUP_HOURS,
-                  time_left=None, close_code: str = NO_RESPONSE_CLOSE_CODE) -> list[dict]:
+                  time_left=None, close_code: str = NO_RESPONSE_CLOSE_CODE, close_when_silent: bool = True) -> list[dict]:
     """One pass over every ticket that has waited long enough. One failure never stops the others."""
     time_left = time_left or (lambda: float("inf"))
     rows = client.query("incident", waiting_query(service_user, min_minutes), fields="sys_id,number",
@@ -139,7 +160,10 @@ def run_followups(client, desk, store, service_user: str, min_minutes: int, wait
             if incident is None:
                 results.append({"number": row.get("number"), "outcome": "not_found"})
                 continue
-            outcome = follow_up(desk, {**incident, "sys_id": sys_id}, store, wait_hours, close_code=close_code)
+            stamp = incident.get("sys_updated_on")
+            outcome = follow_up(desk, {**incident, "sys_id": sys_id}, store, wait_hours, close_code=close_code,
+                                close_when_silent=close_when_silent,
+                                still_current=lambda: (client.get_incident(sys_id) or {}).get("sys_updated_on") == stamp)
         except Exception as error:
             logger.exception("Follow-up failed on %s", row.get("number"))
             outcome = {"outcome": "error", "error": type(error).__name__}

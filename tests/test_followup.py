@@ -89,13 +89,59 @@ def test_a_caller_reply_is_left_to_the_reply_path():
     assert follow_up(desk, incident)["outcome"] == "caller_replied" and desk.actions == []
 
 
-def test_urgent_incidents_go_to_a_technician_instead_of_closing():
-    incident, desk = waiting(priority="2 - High"), DryRunDesk()
+def test_urgent_and_security_tickets_go_to_people_without_reminders():
+    desk = DryRunDesk()
+    assert follow_up(desk, waiting(priority="2 - High"))["outcome"] == "urgent_to_technician"
+    risky = {**waiting(), "short_description": "I clicked a link in a weird email and typed my password"}
+    assert follow_up(desk, risky)["outcome"] == "security_to_technician"
+    assert [a["action"] for a in desk.actions] == ["back_to_technician"] * 2
+    assert desk.actions[1]["team"] == "Security" and "we'll close" not in str(desk.actions)
+
+
+def test_no_response_close_can_be_turned_off():
+    incident, desk = waiting(), DryRunDesk()
     for _ in range(2):
-        follow_up(desk, incident)
+        follow_up(desk, incident, close_when_silent=False)
         incident = apply(incident, desk.actions[-1])
-    assert follow_up(desk, incident)["outcome"] == "urgent_to_technician"
+    assert "technician will review" in desk.actions[-1]["comment"]
+    assert follow_up(desk, incident, close_when_silent=False)["outcome"] == "no_response_to_technician"
     assert desk.actions[-1]["action"] == "back_to_technician"
+
+
+def test_a_reply_that_lands_while_the_job_runs_is_never_lost():
+    desk = DryRunDesk()
+    # the caller replied between the job reading the ticket and writing: nothing is written
+    assert follow_up(desk, waiting(), still_current=lambda: False)["outcome"] == "changed_meanwhile"
+    assert desk.actions == []
+    # a reply posted just before our reminder still counts as the caller's reply afterwards
+    incident = waiting()
+    follow_up(desk, incident)
+    incident = apply(incident, desk.actions[-1])
+    reminder = incident["comments"].split("\n\n")[0]
+    older = "\n\n".join(incident["comments"].split("\n\n")[1:])
+    incident["comments"] = (reminder + "\n\n2026-10-20 09:59:00 - Abel Tuter (Additional comments)\nstill broken\n\n"
+                            + older)
+    assert follow_up(DryRunDesk(), incident)["outcome"] == "caller_replied"
+    follow = DryRunDesk()
+    assert handle_caller_reply(FakeLLM(), build_guardrail({}), follow, incident)["outcome"] == "back_to_technician"
+
+
+def test_stale_claims_are_taken_over_by_exactly_one_run():
+    store = MemoryStore()
+    store.put("followup#x#reminder1", {"at": 0})
+    from followup import _claim
+    assert _claim(store, "followup#x#reminder1", 10_000) is True
+    assert _claim(store, "followup#x#reminder1", 10_001) is False          # fresh again: nobody else wins
+    stale = store.get("followup#x#reminder1")
+    store.put("followup#x#reminder1", {"at": 1})                         # another run swapped it first
+    assert store.replace_if("followup#x#reminder1", {"at": 2}, stale) is False
+
+
+def test_a_renamed_service_desk_group_still_counts():
+    desk = ServiceNowDesk(Client({}), team_groups={"Service Desk": "IT Help Desk"})
+    assert follow_up(desk, {**waiting(), "assignment_group": "IT Help Desk"}, still_current=lambda: True)["outcome"] \
+        == "reminder_1"
+    assert follow_up(desk, {**waiting(), "assignment_group": "Network"})["outcome"] == "not_service_desk"
 
 
 def test_overlapping_runs_never_send_the_same_reminder_twice():
@@ -176,6 +222,9 @@ def test_scheduled_handler(monkeypatch):
     app.servicenow_followups({"minutes": 0}, None)                     # manual test run: everything idle is due
     assert client.queries[-1].endswith("@minute@ago@0")
     assert "error" in app.servicenow_followups({"minutes": "soon"}, None)
+    client.incidents["c" * 32] = {"number": "INC0010301"}                # one broken ticket fails the run...
+    with pytest.raises(RuntimeError, match="INC0010301"):
+        app.servicenow_followups({"minutes": 0}, None)                    # ...so the error alarm fires
     monkeypatch.setenv("SN_MODE", "suggest")
     assert "skipped" in app.servicenow_followups({}, None)
     app._cache.clear()

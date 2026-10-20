@@ -11,8 +11,9 @@ a technician.
 import copy
 import re
 
-from agent import (AI_COMMENT_START, AGENT_HEADER, CONFIRM_MARKER, DEFAULT_TEAM, executed_lines, simulated,
-                   simulation_notice, verified_fix, verified_resolution)
+from agent import (AI_COMMENT_START, AGENT_HEADER, CONFIRM_MARKER, DEFAULT_TEAM, _is_resolved, executed_lines,
+                   looks_like_security, simulated, simulation_notice, verified_fix, verified_resolution,
+                   with_service_desk)
 from .framework import AuditLog, Context, MemoryStore, Toolkit, ToolError
 from .sim import SimBackends
 from .workflows import build_registry
@@ -85,7 +86,12 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
     failed = [r for r in results if r.get("tool") and not r.get("ok") and not r.get("rejected")]
     rejected = [r for r in results if r.get("rejected")]
     audit = "\n".join(f"- {e['action']}: {e.get('tool', '')}" for e in kit.ctx.audit.entries)
-    if done and not failed and verified_fix(kit.ctx.executed, incident, resolve_simulated):
+    # Close only if nobody else has taken it over since the request: no technician, not linked to an outage,
+    # still with the Service Desk, not already resolved, and nothing that looks like a security problem.
+    untouched = not str(incident.get("assigned_to") or "").strip() and not str(incident.get("parent_incident") or "").strip() \
+        and with_service_desk(incident, desk) and not _is_resolved(str(incident.get("state") or "").lower()) \
+        and not looks_like_security(incident)
+    if done and not failed and untouched and verified_fix(kit.ctx.executed, incident, resolve_simulated):
         # The approved action read its end state back from the system: resolve now, the caller can reopen.
         steps = [f"- approved by {approver}"] + [f"- {e['action']}: {e.get('tool', '')}" for e in kit.ctx.audit.entries]
         comment, note, close_notes = verified_resolution(kit.ctx.caller_messages, kit.ctx.executed, steps)

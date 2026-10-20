@@ -399,15 +399,20 @@ def servicenow_followups(event, context):
         client = _servicenow()
         results = run_followups(client, _desk(client), _enterprise_store(), os.environ.get("SN_USER", ""),
                                 minutes, wait_hours, time_left,
-                                close_code=os.environ.get("SN_NO_RESPONSE_CLOSE_CODE") or NO_RESPONSE_CLOSE_CODE)
+                                close_code=os.environ.get("SN_NO_RESPONSE_CLOSE_CODE") or NO_RESPONSE_CLOSE_CODE,
+                                close_when_silent=os.environ.get("SN_NO_RESPONSE_CLOSE", "true") == "true")
     except ServiceNowError as error:
         if error.status == 401:  # password rotated: read it again next run
             _cache.pop("servicenow", None)
             _cache.pop("sn_password", None)
-        logger.warning("Follow-up run failed: %s", error)
-        return {"error": str(error)}
+        logger.error("Follow-up run failed: %s", error)
+        raise   # a failed run shows up in the Lambda Errors metric (and its alarm), not just in a log line
     for result in results:
         logger.info(json.dumps({"event": "servicenow_followup", **result}))
+    failed = [r for r in results if r["outcome"] == "error"]
+    if failed:   # the rest were handled; fail the run so the alarm fires (step claims prevent repeats)
+        raise RuntimeError(f"follow-up failed on {len(failed)} incident(s): "
+                           + ", ".join(str(r.get("number")) for r in failed))
     counts = {}
     for result in results:
         counts[result["outcome"]] = counts.get(result["outcome"], 0) + 1

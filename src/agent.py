@@ -68,6 +68,32 @@ def executed_lines(executed: list[dict]) -> list[str]:
     return [f"- {e['tool']} (workflow {e['workflow']}, {'SIMULATED' if e.get('simulated') else 'live'})"
             for e in executed]
 AI_COMMENT_START = "Hi, this is the IT help desk's AI assistant"
+REMINDER_START = AI_COMMENT_START + ", following up"     # follow-up reminders (followup.py)
+# Code-level check, not left to the prompt: an incident whose text looks like a security problem is never
+# closed by the AI (no instant resolve, no timer) and is routed to Security for review.
+SECURITY_TEXT = re.compile(
+    r"phish|suspicious|malware|virus|ransom|hack|compromis|scam|fraud|breach|unauthori[sz]ed|"
+    r"clicked (?:on )?(?:a |the |an )?(?:bad |weird |strange )?(?:link|attachment)|"
+    r"(?:typed|entered|gave|shared|put) (?:in )?(?:my )?(?:password|credentials|login)|"
+    r"(?:weird|strange|fake|bad) (?:site|website|link|email|login page)", re.I)
+
+
+def incident_text(incident: dict) -> str:
+    return f"{incident.get('short_description') or ''} {incident.get('description') or ''}"
+
+
+def looks_like_security(incident: dict) -> bool:
+    return bool(SECURITY_TEXT.search(incident_text(incident)))
+
+
+def service_desk_group(desk) -> str:
+    return (getattr(desk, "team_groups", None) or {}).get(DEFAULT_TEAM, DEFAULT_TEAM)
+
+
+def with_service_desk(incident: dict, desk) -> bool:
+    """Still in the Service Desk queue (or not assigned to any group): another team owns it otherwise."""
+    group = str(incident.get("assignment_group") or "").strip()
+    return not group or group == service_desk_group(desk)
 MAX_STEPS = 5
 ENTERPRISE_MAX_STEPS = 10
 MAX_SEARCHES = 3
@@ -200,6 +226,16 @@ def verified_fix(executed: list[dict], incident: dict, allow_simulated: bool = F
     SIMULATED everywhere). The public demo opts in because it writes nothing."""
     return bool(executed) and all(e.get("verifies_fix") for e in executed) \
         and priority_number(incident.get("priority")) >= 3 and (allow_simulated or not simulated(executed))
+
+
+BLOCKING_RESULTS = {"failed", "unknown_outcome", "unavailable", "approval requested", "denied"}
+
+
+def clean_run(kit) -> bool:
+    """No write was refused, failed, timed out, or is still waiting for an approver. Only then does
+    "every action that ran was verified" mean the whole request was handled."""
+    return not kit.pending_approvals and not any(
+        t.get("risk") != "read" and t.get("result") in BLOCKING_RESULTS for t in kit.trace)
 
 
 def verified_resolution(caller_messages: list[str], executed: list[dict], step_lines: list[str]) -> tuple:
@@ -376,8 +412,11 @@ class TicketAgent:
 
     def _report_actions(self, incident, state) -> dict:
         kit = self.toolkit
-        if verified_fix(kit.ctx.executed, incident, self.resolve_simulated) and not self._similar(incident, "", state)["possible_outage"]:
+        security = looks_like_security(incident)
+        if not security and clean_run(kit) and verified_fix(kit.ctx.executed, incident, self.resolve_simulated) \
+                and not self._similar(incident, "", state)["possible_outage"]:
             return self._resolve_verified(incident, state)
+        team = "Security" if security else DEFAULT_TEAM
         comment = "\n".join([AI_COMMENT_START + ". Here's what we did:", "", *simulation_notice(kit.ctx.executed),
                              *[f"- {m}" for m in kit.ctx.caller_messages], "",
                              "Please reply to let us know: is it working now? If yes, we'll close the ticket. "
@@ -387,12 +426,16 @@ class TicketAgent:
                           + "; sent the results to the caller; On Hold - Awaiting Caller.", CONFIRM_MARKER + ".", "",
                           "Actions executed:", *executed_lines(kit.ctx.executed), "",
                           "Steps:", *self._step_lines(state), "",
+                          *(["Possible security incident (code check on the incident text): assigned to Security "
+                             "for review. The AI won't close it, on a reply or on a timer.", ""] if security else []),
+                          *(["Not closed automatically: an action failed, was refused, or still needs an approver.", ""]
+                            if not clean_run(kit) else []),
                           "Not resolved yet: it is resolved only if the caller confirms the fix worked; otherwise it",
                           "comes back to the Service Desk with the caller's reply."])
-        self.desk.send_fix(incident, comment=comment, work_note=note, team=DEFAULT_TEAM)
-        state["steps"].append({"tool": "complete_and_confirm", "detail": "results sent; On Hold - Awaiting Caller",
-                               "simulated": False})
-        return {"action": "awaiting_caller", "team": DEFAULT_TEAM, "priority": priority_number(incident.get("priority")),
+        self.desk.send_fix(incident, comment=comment, work_note=note, team=team)
+        state["steps"].append({"tool": "complete_and_confirm", "detail": "results sent; On Hold - Awaiting Caller"
+                               + ("; assigned to Security for review" if security else ""), "simulated": False})
+        return {"action": "awaiting_caller", "team": team, "priority": priority_number(incident.get("priority")),
                 "executed": [e["tool"] for e in kit.ctx.executed]}
 
     def _resolve_verified(self, incident, state) -> dict:
@@ -682,9 +725,13 @@ QUOTE_START = re.compile(r"^\s*(>|On .+ wrote:|-{2,}\s*Original Message|From: |"
 
 
 def latest_caller_reply(journal: str) -> dict | None:
-    """Newest customer-visible comment that wasn't written by the AI. Journal text is newest first.
-    Quoted email text (our own message, "On ... wrote:", "> ...") is cut off before classifying."""
+    """Newest customer-visible comment that wasn't written by the AI, since the AI's last fix or
+    resolution. Journal text is newest first. Our own reminders are skipped, so a reply that arrived just
+    before a reminder was posted still counts. Quoted email text (our own message, "On ... wrote:",
+    "> ...") is cut off before classifying."""
     for when, author, text in JOURNAL_ENTRY.findall(journal or ""):
+        if text.strip().startswith(REMINDER_START):
+            continue
         if text.strip().startswith(AI_COMMENT_START):
             return None  # the newest comment is our own fix: no reply yet
         own = QUOTE_START.split(text, maxsplit=1)[0].strip()
@@ -743,6 +790,8 @@ def handle_caller_reply(llm, guardrail, desk, incident: dict, final_attempt: boo
         return {"outcome": "not_waiting"}
     if str(incident.get("assigned_to") or "").strip():
         return {"outcome": "technician_assigned"}  # a person already owns it: stay out of the way
+    if not with_service_desk(incident, desk):
+        return {"outcome": "not_service_desk"}     # e.g. Security reviews it: that team closes it
     if "Caller reply at " in notes:
         return {"outcome": "already_handled"}
     reply, verdict, quoted = _read_reply(llm, guardrail, incident, final_attempt)
@@ -765,6 +814,8 @@ def handle_caller_reply(llm, guardrail, desk, incident: dict, final_attempt: boo
 def _reply_after_ai_resolution(llm, guardrail, desk, incident, final_attempt) -> dict:
     """The caller wrote on a ticket the AI resolved. "It works, thanks" leaves it resolved (and writes
     nothing, so a later "it broke again" can still reopen it); anything else reopens it for a technician."""
+    if str(incident.get("assigned_to") or "").strip():
+        return {"outcome": "technician_assigned"}   # a person re-resolved or owns it: leave it to them
     reply, verdict, quoted = _read_reply(llm, guardrail, incident, final_attempt)
     if not reply:
         return {"outcome": "no_reply"}

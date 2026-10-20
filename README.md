@@ -147,13 +147,17 @@ for them** (and stop waiting after two reminders). "Action verified" and "issue 
 | Something only the caller can judge (KB how-to, VPN steps, software install, device sync) | On Hold - Awaiting Caller. Reminder after 1 day, last reminder after 2, resolved on day 3 (`src/followup.py`, hourly) | Close code `No resolution provided`, close notes "no response after 2 reminders, not confirmed fixed" |
 | Caller replies "it worked" | Resolved | Close notes quote the caller |
 | Caller replies anything else, even after the AI resolved it | Reopened (In Progress) for the Service Desk with the reply | Work note quotes the reply |
-| Urgent (priority 1-2), security, outage-linked, or moved to another team | Never closed by the AI: escalated, or handed to a technician at strike 3 | - |
+| Urgent (priority 1-2), security, outage-linked, or moved to another team | Never closed by the AI: escalated, or handed to a technician instead of a first reminder. Security is a code check on the incident text (phishing, typed a password on a strange site, malware...), not only the model's judgment: those go to the Security group | - |
+| Part of the request failed, was refused, or still waits for an approver | Not closed: the caller gets the results so far and the Service Desk sees what's missing | Work note says why it wasn't closed |
 
 The AI only ever sets **Resolved**; ServiceNow's normal auto-close turns that into Closed later, which
 is the window in which the caller can reply to reopen. The follow-up job keeps no schedule of its own:
 it reads ServiceNow (On Hold - Awaiting Caller, unassigned, last touched by the AI's account) and counts
 its own "Follow-up reminder N of 2" work notes, so any human touch takes the ticket out of its hands, and
 each step is claimed in DynamoDB so two overlapping runs can't send the same reminder twice.
+Right before each write it re-reads the ticket, so a caller reply that lands mid-run is never talked
+over. `ServiceNowNoResponseClose=false` turns the day-3 close off: silent tickets go to a technician for
+review instead. A failed run raises (Lambda Errors alarm, emailed with `AlarmEmail`).
 `ServiceNowFollowUpHours` (default 24) sets the interval; a manual run can treat everything idle as due:
 `aws lambda invoke --function-name <ServiceNowFollowUpFunctionName> --payload '{"minutes": 0}' out.json`.
 
@@ -238,14 +242,16 @@ Nothing in this project changes a real account, device, or license.
 | 9 | Log analysis and root cause | Analysis **real**, logs simulated | Groups recurring events, correlates chains (failed sign-ins -> lockout, disk errors -> corruption), root cause | Own devices only | 1 |
 | 10 | Outlook and Microsoft 365 diagnostics | Simulated Exchange Online | Quota, archive, OST size, external forwarding (flagged for Security), message trace | Own mailbox only | 1 |
 | 11 | Onboarding and offboarding | Simulated Entra ID / M365 / HR | Role-template checklist (account, groups, licenses, software, device), offboarding (disable, revoke, remove, free seats); resumes after a failed step | Manager requests, HR approval, identity | 2 |
-| 12 | Follow-up and resolution verification | **Real** ServiceNow | Verified fix (real system) -> Resolved; caller confirms -> Resolved; silence -> reminders on day 1 and 2, resolved as no response on day 3; any other reply, even after resolving -> reopened for a technician | Caller only; never urgent, security, or outage tickets | 20 (+ agent tests) |
+| 12 | Follow-up and resolution verification | **Real** ServiceNow | Verified fix (real system) -> Resolved; caller confirms -> Resolved; silence -> reminders on day 1 and 2, resolved as no response on day 3; any other reply, even after resolving -> reopened for a technician | Caller only; never urgent, security, or outage tickets | 27 (+ agent tests) |
 
-Two independent code reviews (agent, then a security review of the enterprise framework) found
-issues that were fixed and now have regression tests, for example repeated resets via reworded
-arguments, a timed-out write retried by the model, approver taken from later edits, and HR records
-readable by anyone.
+Three independent code reviews (agent, a security review of the enterprise framework, then the
+close-without-the-caller policy) found issues that were fixed and now have regression tests, for
+example repeated resets via reworded arguments, a timed-out write retried by the model, approver taken
+from later edits, HR records readable by anyone, a security incident that could have been auto-resolved
+after an unlock, a resolve while another action still waited for approval, and a caller reply that could
+be lost if it landed while the follow-up job was writing.
 
-Tests: `tests/test_enterprise.py` (51), `tests/test_followup.py` (16) and `tests/test_agent.py` (26), 188 in
+Tests: `tests/test_enterprise.py` (54), `tests/test_followup.py` (20) and `tests/test_agent.py` (26), 195 in
 the suite. They cover
 success, permission denials, identity and approval gates, retries after throttling, timeouts (reads
 retried; writes never blindly repeated), duplicate requests (SQS redelivery), resumable lifecycle

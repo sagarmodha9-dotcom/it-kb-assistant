@@ -88,6 +88,11 @@ Parameters:
     MinValue: 1
     MaxValue: 168
     Description: "Hours between follow-ups when a caller doesn't answer: reminder after 1x, reminder after 2x, resolved after 3x (the 3-strike rule)."
+  ServiceNowNoResponseClose:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: "true: after two unanswered reminders the AI resolves the ticket as 'No resolution provided' (3-strike rule). false: it hands the ticket to a technician to review instead of closing it."
   ServiceNowResolveSimulated:
     Type: String
     AllowedValues: ["true", "false"]
@@ -634,6 +639,7 @@ Resources:
           SN_FOLLOWUP_HOURS: !Ref ServiceNowFollowUpHours
           ENTERPRISE_TABLE: !Ref EnterpriseStateTable   # per-step claims, so overlapping runs never double-send
           SN_NO_RESPONSE_CLOSE_CODE: No resolution provided   # a timeout is never recorded as a fix
+          SN_NO_RESPONSE_CLOSE: !Ref ServiceNowNoResponseClose
       Policies:
         - Statement:
             - Effect: Allow
@@ -650,6 +656,24 @@ Resources:
           Properties:
             Schedule: rate(1 hour)
             Description: Caller follow-ups (3-strike rule)
+
+  ServiceNowFollowUpErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: UseServiceNow
+    Properties:
+      AlarmDescription: The caller follow-up job (3-strike rule) failed; reminders or closes may be stuck
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ServiceNowFollowUpFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [SendAlarmEmail, [!Ref ServiceNowAlarmTopic], !Ref AWS::NoValue]
 
   ServiceNowAlarmTopic:
     Type: AWS::SNS::Topic

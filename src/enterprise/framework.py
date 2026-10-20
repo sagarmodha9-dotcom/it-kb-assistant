@@ -107,6 +107,13 @@ class MemoryStore:
         self.items[key] = value
         return True
 
+    def replace_if(self, key: str, value: dict, expected: dict) -> bool:
+        """Compare-and-swap: write only if the item is still exactly `expected`."""
+        if self.items.get(key) != expected:
+            return False
+        self.items[key] = value
+        return True
+
 
 class DynamoStore:
     """DynamoDB-backed store: pk (string) -> JSON document, conditional writes for idempotency."""
@@ -124,6 +131,17 @@ class DynamoStore:
                          "expires_at": {"N": str(int(time.time()) + self.ttl * 86400)}}}
         if if_absent:
             args["ConditionExpression"] = "attribute_not_exists(pk)"
+        return self._put(args)
+
+    def replace_if(self, key, value, expected):
+        """Compare-and-swap on the stored JSON document."""
+        return self._put({"TableName": self.table,
+                          "Item": {"pk": {"S": key}, "doc": {"S": json.dumps(value)},
+                                   "expires_at": {"N": str(int(time.time()) + self.ttl * 86400)}},
+                          "ConditionExpression": "#d = :old", "ExpressionAttributeNames": {"#d": "doc"},
+                          "ExpressionAttributeValues": {":old": {"S": json.dumps(expected)}}})
+
+    def _put(self, args) -> bool:
         try:
             self.client.put_item(**args)
             return True
