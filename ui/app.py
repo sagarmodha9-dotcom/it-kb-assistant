@@ -24,6 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from factory import build_assistant, build_guardrail, setting  # noqa: E402
+from lifecycle import CHOICES, play  # noqa: E402
 from tickets import TicketClient, TicketError  # noqa: E402
 
 
@@ -142,6 +143,23 @@ sup.kb-cite { display: inline-flex; align-items: center; justify-content: center
 .kb-agent li { font-size: .84rem; color: var(--muted); line-height: 1.5; margin: .1rem 0; }
 .kb-agent li b { color: var(--ink); font-weight: 500; }
 .kb-agent-foot { font-size: .78rem; color: var(--muted); }
+.kb-next { border-top: 1px solid var(--line); padding-top: .75rem; margin-top: .15rem; }
+.kb-next-title { font-size: .8rem; font-weight: 600; color: var(--muted); margin-bottom: .2rem; }
+.kb-next-hint { font-size: .8rem; color: var(--muted); margin-bottom: .4rem; }
+[class*="st-key-next-"] button { justify-content: flex-start; min-height: 2.4rem; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 8px; color: var(--ink); }
+[class*="st-key-next-"] button:hover { border-color: var(--cite); color: var(--cite); }
+[class*="st-key-next-"] button p { font-size: .85rem; text-align: left; white-space: normal; }
+.kb-timeline { list-style: none; margin: .5rem 0 0; padding: 0 0 0 1rem; border-left: 2px solid var(--line); }
+.kb-timeline li { position: relative; margin: 0 0 .8rem; padding-left: .3rem; }
+.kb-timeline li::before { content: ""; position: absolute; left: -1.42rem; top: .35rem; width: .7rem; height: .7rem;
+  border-radius: 50%; background: var(--surface); border: 2px solid var(--cite); }
+.kb-timeline .when { font-size: .74rem; font-weight: 600; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .04em; }
+.kb-timeline .state { font-size: .88rem; font-weight: 600; color: var(--ink); }
+.kb-timeline .why { font-size: .84rem; color: var(--muted); line-height: 1.5; }
+.kb-timeline blockquote { margin: .35rem 0 0; padding: .45rem .7rem; border-left: 3px solid var(--cite-bg);
+  background: var(--paper); font-size: .82rem; color: var(--ink); line-height: 1.5; white-space: pre-line; }
 .kb-sim { font-size: .68rem; font-weight: 600; color: var(--warn); background: var(--warn-bg); border-radius: 4px;
   padding: 0 .3rem; margin-left: .2rem; }
 [data-testid="stSidebar"] ul.kb-flows { list-style: none; padding: 0; margin: .3rem 0 0; }
@@ -334,6 +352,34 @@ def agent_html(plan: dict) -> str:
             "</div></div>")
 
 
+def timeline_html(events: list[dict]) -> str:
+    rows = []
+    for e in events:
+        comment = (f"<blockquote>{html.escape(e['comment'])}</blockquote>" if e.get("comment") else "")
+        rows.append(f'<li><div class="when">{html.escape(e["when"])}</div><div class="state">'
+                    f'{html.escape(e["state"])}</div><div class="why">{html.escape(e["summary"])}</div>{comment}</li>')
+    return f'<ol class="kb-timeline">{"".join(rows)}</ol>'
+
+
+def next_steps(i: int, turn: dict) -> None:
+    """Let the visitor play the caller and watch the ticket's next steps, run by the same policy code as the
+    ServiceNow integration (agent.py, followup.py) against a dry-run desk: nothing is written anywhere."""
+    plan = turn.get("agent") or {}
+    choices = CHOICES.get(plan.get("action"), [])
+    if not choices:
+        return
+    st.markdown('<div class="kb-next"><div class="kb-next-title">What happens next? Play the caller</div>'
+                '<div class="kb-next-hint">Runs the same follow-up and reopen code as the live ServiceNow '
+                "integration, as a dry run (nothing is sent or written).</div></div>", unsafe_allow_html=True)
+    cols = st.columns(len(choices))
+    for n, (key, label) in enumerate(choices):
+        if cols[n].button(label, key=f"next-{i}-{key}", use_container_width=True):
+            turn["lifecycle"] = {"choice": key, "events": play(plan["action"], key, turn.get("question") or "")}
+            st.rerun()
+    if turn.get("lifecycle"):
+        st.markdown(timeline_html(turn["lifecycle"]["events"]), unsafe_allow_html=True)
+
+
 def show_turn(i: int, turn: dict) -> None:
     with st.chat_message("assistant", avatar=":material/support_agent:"):
         with st.container(key=f"answer-{i}"):
@@ -343,6 +389,7 @@ def show_turn(i: int, turn: dict) -> None:
                 st.markdown(sources_html(turn["sources"]), unsafe_allow_html=True)
             if turn.get("agent"):
                 st.markdown(agent_html(turn["agent"]), unsafe_allow_html=True)
+                next_steps(i, turn)
             if turn.get("ticket"):
                 ok, message = turn["ticket"]
                 (st.success if ok else st.error)(message)
@@ -360,8 +407,8 @@ intro = ("Ask an IT question in plain words. Answers come only from the company'
          "one shows the passages it used so you can check it. If the articles don't cover something, "
          "it says so instead of guessing.")
 if PUBLIC_DEMO:
-    intro += (" Each answer also shows what the AI ticket agent would do with it as a ServiceNow incident: "
-              "send the fix and wait for the caller to confirm, or escalate to the right team.")
+    intro += (" Each answer also shows what the AI ticket agent would do with it as a ServiceNow incident, and "
+              "you can play the caller to see what happens next: confirmed, still broken, or no reply at all.")
 if not PUBLIC_DEMO:
     intro += " When it can't help, it can open a ticket."
 st.markdown(f'<div class="kb-head"><h1>IT Help Desk Assistant</h1><p>{intro}</p></div>', unsafe_allow_html=True)
@@ -382,8 +429,9 @@ with st.sidebar:
         st.markdown("### About this demo")
         st.markdown('<div class="kb-side"><p>Retrieval-augmented generation over an IT knowledge base, '
                     "running serverless on AWS. In the private deployment, a ticket agent built on it works "
-                    "every new ServiceNow incident: it sends a verified fix and resolves only after the caller "
-                    "confirms, or escalates with a handoff note.</p></div>", unsafe_allow_html=True)
+                    "every new ServiceNow incident: it fixes what it can, sends a verified fix, or escalates with a "
+                    "handoff note, and closes a ticket only with evidence (a verified fix, the caller's "
+                    "confirmation, or two unanswered reminders).</p></div>", unsafe_allow_html=True)
         stack = [("Model", "Claude Haiku 4.5"), ("Embeddings", "Voyage AI"), ("Vector store", "Amazon S3 Vectors"),
                  ("Safety", "Bedrock Guardrails"), ("Runtime", "AWS Lambda")]
         st.markdown('<ul class="kb-stack">' + "".join(f"<li><span>{k}</span><span>{v}</span></li>" for k, v in stack)
@@ -420,6 +468,14 @@ if not turns:
     for n, example in enumerate(EXAMPLES):
         if cols[n % 2].button(example, key=f"starter-{n}", use_container_width=True):
             st.session_state["pending"] = example
+    if PUBLIC_DEMO:
+        with st.expander("See it run live in ServiceNow"):
+            st.caption("Real incidents on a ServiceNow developer instance, worked by this agent. Account actions "
+                       "run against a simulated directory and say so on the ticket.")
+            st.image(os.path.join(ROOT, "assets", "servicenow-verified-fix-resolved.png"),
+                     caption="Verified fix: unlocked, checked, and resolved in 22 seconds (Solution provided)")
+            st.image(os.path.join(ROOT, "assets", "servicenow-no-response-3-strike.png"),
+                     caption="No reply: two reminders, then closed as No resolution provided, never as fixed")
     st.markdown('<div class="kb-label">How each answer is checked</div>', unsafe_allow_html=True)
     st.markdown('<ol class="kb-steps">' + "".join(f"<li><b>{t}</b>{d}</li>" for t, d in STEPS) + "</ol>",
                 unsafe_allow_html=True)

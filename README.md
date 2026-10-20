@@ -135,6 +135,20 @@ flowchart TD
     RES & NR -.->|caller replies 'still broken'| BACK
 ```
 
+#### Live in ServiceNow (Oct 19 2026)
+
+| Verified fix, resolved in 22 seconds | No reply: two reminders, then closed as no response |
+|---|---|
+| ![INC0010053: unlock verified in the simulated directory, resolved with "Solution provided"](assets/servicenow-verified-fix-resolved.png) | ![INC0010050: reminder 1, reminder 2, then resolved with "No resolution provided"](assets/servicenow-no-response-3-strike.png) |
+
+Then the caller replied "Still can't sign in" on the resolved INC0010053, and the agent reopened it for a
+technician (In Progress, reply quoted in the work note). Live testing also found one bug: newer
+ServiceNow releases label customer comments "(Comments)" instead of "(Additional comments)", so replies
+were missed. Fixed, with a regression test built from the live instance's text.
+
+In the public demo you can play the caller after any answer ("it works", "still broken", or no reply)
+and watch the same policy code decide what happens next, as a dry run.
+
 #### When a ticket closes without the caller
 
 The rule in one line: **if the system can prove it's fixed, close it; if only the person can tell, wait
@@ -242,7 +256,7 @@ Nothing in this project changes a real account, device, or license.
 | 9 | Log analysis and root cause | Analysis **real**, logs simulated | Groups recurring events, correlates chains (failed sign-ins -> lockout, disk errors -> corruption), root cause | Own devices only | 1 |
 | 10 | Outlook and Microsoft 365 diagnostics | Simulated Exchange Online | Quota, archive, OST size, external forwarding (flagged for Security), message trace | Own mailbox only | 1 |
 | 11 | Onboarding and offboarding | Simulated Entra ID / M365 / HR | Role-template checklist (account, groups, licenses, software, device), offboarding (disable, revoke, remove, free seats); resumes after a failed step | Manager requests, HR approval, identity | 2 |
-| 12 | Follow-up and resolution verification | **Real** ServiceNow | Verified fix (real system) -> Resolved; caller confirms -> Resolved; silence -> reminders on day 1 and 2, resolved as no response on day 3; any other reply, even after resolving -> reopened for a technician | Caller only; never urgent, security, or outage tickets | 45 (+ agent tests) |
+| 12 | Follow-up and resolution verification | **Real** ServiceNow | Verified fix (real system) -> Resolved; caller confirms -> Resolved; silence -> reminders on day 1 and 2, resolved as no response on day 3; any other reply, even after resolving -> reopened for a technician | Caller only; never urgent, security, or outage tickets | 52 (+ agent tests) |
 
 Three independent code reviews (agent, a security review of the enterprise framework, then the
 close-without-the-caller policy) found issues that were fixed and now have regression tests, for
@@ -251,7 +265,7 @@ from later edits, HR records readable by anyone, a security incident that could 
 after an unlock, a resolve while another action still waited for approval, and a caller reply that could
 be lost if it landed while the follow-up job was writing.
 
-Tests: `tests/test_enterprise.py` (55), `tests/test_followup.py` (37) and `tests/test_agent.py` (26), 213 in
+Tests: `tests/test_enterprise.py` (55), `tests/test_followup.py` (38), `tests/test_lifecycle.py` (6) and `tests/test_agent.py` (26), 220 in
 the suite. They cover
 success, permission denials, identity and approval gates, retries after throttling, timeouts (reads
 retried; writes never blindly repeated), duplicate requests (SQS redelivery), resumable lifecycle
