@@ -91,7 +91,7 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
     untouched = not str(incident.get("assigned_to") or "").strip() and not str(incident.get("parent_incident") or "").strip() \
         and with_service_desk(incident, desk) and not _is_resolved(str(incident.get("state") or "").lower()) \
         and not looks_like_security(incident)
-    if done and not failed and untouched and verified_fix(kit.ctx.executed, incident, resolve_simulated):
+    if done and not failed and not undecided and untouched and verified_fix(kit.ctx.executed, incident, resolve_simulated):
         # The approved action read its end state back from the system: resolve now, the caller can reopen.
         steps = [f"- approved by {approver}"] + [f"- {e['action']}: {e.get('tool', '')}" for e in kit.ctx.audit.entries]
         comment, note, close_notes = verified_resolution(kit.ctx.caller_messages, kit.ctx.executed, steps)
@@ -105,7 +105,9 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
                           + (" [SIMULATED backends: no real change]" if simulated(kit.ctx.executed) else "") + ".",
                           CONFIRM_MARKER + ".", "", "Actions executed:", *executed_lines(kit.ctx.executed), "",
                           "Audit:", audit])
-        desk.send_fix(incident, comment=comment, work_note=note, team=DEFAULT_TEAM)
+        # keep the ticket with whoever owns it now (Security, another team); only an unowned one goes to the Service Desk
+        desk.send_fix(incident, comment=comment, work_note=note,
+                      team=DEFAULT_TEAM if with_service_desk(incident, desk) else None)
         return {"outcome": "executed_awaiting_caller", "results": results}
     if rejected:
         desk.back_to_technician(incident, DEFAULT_TEAM, "\n".join([AGENT_HEADER, f"Rejected by {approver}.", "", audit]),

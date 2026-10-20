@@ -29,7 +29,7 @@ import logging
 import re
 import time
 
-from agent import (AGENT_HEADER, AI_COMMENT_START, CONFIRM_MARKER, DEFAULT_TEAM, REMINDER_START, REOPEN_INVITE,
+from agent import (AGENT_HEADER, CONFIRM_MARKER, DEFAULT_TEAM, REMINDER_START, REOPEN_INVITE, UPDATE_START,
                    RESOLVED_MARKER, latest_caller_reply, looks_like_security, priority_number, with_service_desk)
 
 logger = logging.getLogger(__name__)
@@ -131,7 +131,7 @@ def follow_up(desk, incident: dict, store=None, wait_hours: int = FOLLOWUP_HOURS
             "turned off (ServiceNowNoResponseClose=false): review before closing."]))
         return {"outcome": "no_response_to_technician"}
     desk.resolve(incident,
-                 comment=f"{AI_COMMENT_START}. We haven't heard back, so we've resolved this ticket. {REOPEN_INVITE}",
+                 comment=f"{UPDATE_START}. We haven't heard back, so we've resolved this ticket. {REOPEN_INVITE}",
                  work_note="\n".join([
                      AGENT_HEADER, f"Action: resolved after {MAX_REMINDERS} reminders with no reply from the caller "
                      "(3-strike rule).", RESOLVED_MARKER + " (no response).", "",

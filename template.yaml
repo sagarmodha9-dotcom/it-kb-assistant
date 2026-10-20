@@ -630,6 +630,8 @@ Resources:
       Handler: app.servicenow_followups
       Description: Remind callers who haven't confirmed a fix; resolve after two reminders
       Timeout: 120
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0   # a failed run alarms and the next hourly run picks up; no automatic re-runs
       Environment:
         Variables:
           SN_INSTANCE_URL: !Ref ServiceNowInstanceUrl

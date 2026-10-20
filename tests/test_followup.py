@@ -235,3 +235,35 @@ def test_reply_business_rule_uses_the_same_marker():
     with open(path) as f:
         rule = f.read()
     assert f"indexOf('{RESOLVED_MARKER}') == 0" in rule and "hold_reason') == '1'" in rule
+
+
+@pytest.mark.parametrize("text", [
+    "I entered my password wrong too many times and now I am locked out", "Typed my password and it says incorrect",
+    "Getting 401 Unauthorized on SharePoint", "Antivirus update failing", "Report suspicious email button missing",
+    "Need access to Hackett reports", "I'm locked out of my account", "Password reset please",
+    "I need access to the Finance Reports site"])
+def test_everyday_tickets_are_not_flagged_as_security(text):
+    from agent import looks_like_security
+    assert not looks_like_security({"short_description": text})
+
+
+@pytest.mark.parametrize("text", [
+    "I typed my password on a weird site and got locked out", "I clicked a link in a suspicious email",
+    "My account was hacked", "I think I got phished", "Entered my credentials into a fake login page",
+    "Ransomware note on my screen", "clicked on a strange attachment"])
+def test_security_phrasings_are_flagged(text):
+    from agent import looks_like_security
+    assert looks_like_security({"short_description": text})
+
+
+def test_a_reply_landing_as_the_ai_resolves_still_reopens():
+    incident, desk = waiting(), DryRunDesk()
+    for _ in range(3):
+        follow_up(desk, incident)
+        incident = apply(incident, desk.actions[-1])
+    newest, rest = incident["comments"].split("\n\n", 1)
+    assert "with an update" in newest                       # the AI's resolution comment is newest...
+    incident["comments"] = (newest + "\n\n2026-10-22 09:59:59 - Abel Tuter (Additional comments)\nstill broken\n\n"
+                            + rest)                         # ...but the caller wrote just before it
+    follow = DryRunDesk()
+    assert handle_caller_reply(FakeLLM(), build_guardrail({}), follow, incident)["outcome"] == "reopened"

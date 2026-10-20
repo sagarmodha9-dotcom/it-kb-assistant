@@ -357,7 +357,10 @@ def test_instant_resolve_needs_a_clean_non_security_run():
         return out, desk
     ok = (("verify_caller_identity", {}), ("unlock_account", {}))
     out, desk = run_it(ok + (("complete_and_confirm", {}),), "I typed my password on a weird site and got locked out")
-    assert out["action"] == "awaiting_caller" and out["team"] == "Security" and desk.actions[0]["team"] == "Security"
+    assert out["action"] == "escalated" and out["team"] == "Security" and out["priority"] == 2
+    handoff = desk.actions[0]
+    assert handoff["action"] == "back_to_technician" and handoff["team"] == "Security"
+    assert "Security team will review" in handoff["comment"] and "reply" not in handoff["comment"].lower()
     # another write still waiting for an approver: the request isn't done, so nothing is closed
     out, _ = run_it(ok + (("assign_license", {"sku": "Visio_Plan2"}), ("complete_and_confirm", {})))
     assert out["action"] == "awaiting_caller"
@@ -375,6 +378,26 @@ def test_approved_action_on_a_ticket_someone_took_over_is_not_closed():
     desk = DryRunDesk()
     out = handle_approval_decision(desk, incident, "sam.ortiz", True, store, resolve_simulated=True)
     assert out["outcome"] == "executed_awaiting_caller" and desk.actions[-1]["action"] == "send_fix"
+
+
+def test_approval_path_waits_on_undecided_approvals_and_keeps_the_owning_team():
+    store = MemoryStore()
+    k = verified(kit(caller="taylor.kim", store=store))
+    k.call("add_group_member", {"group": "Finance-Reports"})
+    store.put("pending#INC0010100", {"ids": store.get("pending#INC0010100")["ids"] + ["missing-approval"]})
+    incident = {"sys_id": "a" * 32, "number": "INC0010100", "caller_id": "Taylor Kim", "caller_id.user_name": "taylor.kim",
+                "priority": "4 - Low"}
+    desk = DryRunDesk()
+    out = handle_approval_decision(desk, incident, "sam.ortiz", True, store, resolve_simulated=True)
+    assert out["outcome"] == "executed_awaiting_caller"          # the other approval was never decided
+    assert desk.actions[-1]["team"] == "Service Desk"
+    store2 = MemoryStore()
+    k2 = verified(kit(caller="taylor.kim", store=store2))
+    k2.call("add_group_member", {"group": "Finance-Reports"})
+    desk = DryRunDesk()
+    handle_approval_decision(desk, {**incident, "assignment_group": "Security"}, "sam.ortiz", True, store2,
+                             resolve_simulated=True)
+    assert desk.actions[-1]["action"] == "send_fix" and desk.actions[-1]["team"] is None   # stays with Security
 
 
 def test_a_reply_on_a_re_resolved_ticket_with_a_technician_is_left_alone():
