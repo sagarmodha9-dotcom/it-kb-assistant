@@ -13,7 +13,7 @@ You need your old phone OR a temporary access pass (TAP) from the Service Desk. 
 5. Delete the old phone from the list.
 
 ## Steps (old phone lost, reset, or broken)
-1. Call the Service Desk at extension 4357 and verify your identity with your employee ID and manager's name.
+1. Call the Service Desk at extension 4357. The technician verifies your identity by calling you back on the phone number in your HR record, or by confirming with your manager on Teams; a name and employee ID alone are not enough.
 2. The Service Desk issues a temporary access pass (TAP).
 3. Sign in at https://mysignins.microsoft.com/security-info with the TAP and register the new phone.
 
