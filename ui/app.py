@@ -433,8 +433,8 @@ def stats() -> None:
               f"{h['bm25_paraphrased']:.0%} on the {h['n_paraphrased']} paraphrased"),
              ("22 s", "Live ServiceNow incident to verified resolution",
               "Developer instance, Oct 19 2026. The unlock ran on the simulated directory"),
-             ("11/11", "Public-demo security checks", "Keys, route isolation, input limits, injection, per-visitor cap; "
-              "run against the live API, Oct 19 2026")]
+             ("12/12", "Public-demo security checks", "Keys, route isolation, input limits, injection, dry-run plan, "
+              "per-visitor cap; run against the live API, Oct 20 2026")]
     st.markdown('<div class="kb-stats">' + "".join(
         f'<div class="kb-stat"><div class="v">{esc(v)}</div><div class="l">{esc(lbl)}</div><div class="c">{esc(c)}</div></div>'
         for v, lbl, c in cards) + "</div>", unsafe_allow_html=True)
@@ -930,7 +930,7 @@ def section_evaluation() -> None:
     other = [("ServiceNow incidents (suggest mode)", "35 / 36", "36 incidents from the golden set on a live developer instance, "
               "Oct 19 2026; every incident got its note"),
              ("Input guardrail check", "42 / 42", "All golden-set questions, after fixing over-blocking the evals found"),
-             ("Public-demo security checks", "11 / 11", "Run against the live API, Oct 19 2026"),
+             ("Public-demo security checks", "12 / 12", "Run against the live API after the ticket-desk release, Oct 20 2026"),
              ("Automated tests", "all passing in CI", "Offline unit, integration and UI tests: agent framework, follow-up "
               "policy, the ticket desk and this page")]
     st.markdown('<div class="kb-label">Other measured checks</div><div class="kb-tablewrap"><table class="kb-table">'

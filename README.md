@@ -415,6 +415,8 @@ with `--cost-explorer`, what AWS actually billed).
 - `demo_security_check.py`: **11/11 checks passed** against the deployed API (keys rejected, demo key
   locked out of `/ask` and `/escalate`, unsigned webhook rejected, 301 characters -> 413, citations
   present, no internals returned, prompt injection blocked, 16th request from one visitor -> 429).
+  Rerun after the ticket-desk release on Oct 20 2026: **12/12** (the new check confirms the agent plan
+  the demo returns is a dry run with only the allowed keys).
 - Measured with `demo_cost_report.py` over those checks: 15 questions, **$0.0158 in Claude tokens
   (about $0.001 per question)**, average 1.8 s and p95 3.8 s per answer.
 - Tested from a logged-out browser: a grounded MFA answer with citations, and "not covered" for an
