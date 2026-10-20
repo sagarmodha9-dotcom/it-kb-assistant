@@ -77,8 +77,8 @@ html, body, p, li, h1, h2, h3, h4, label, button, textarea, input, .stMarkdown {
   font-family: 'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif !important; }
 code, pre, .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace !important; }
 [data-testid="stDecoration"], [data-testid="stToolbarActions"] { display: none; }
-.block-container { max-width: 1160px; padding: 1.1rem 1.4rem 4rem; }
-@media (max-width: 640px) { .block-container { padding: .7rem .85rem 3rem; } }
+.block-container { max-width: 1160px; padding: 4.25rem 1.4rem 4rem; }   /* clears Streamlit's top bar */
+@media (max-width: 640px) { .block-container { padding: 3.75rem .85rem 3rem; } }
 
 .kb-top { display: flex; align-items: center; justify-content: space-between; gap: .8rem; flex-wrap: wrap;
   padding: .5rem 0 .85rem; border-bottom: 1px solid var(--line); }
