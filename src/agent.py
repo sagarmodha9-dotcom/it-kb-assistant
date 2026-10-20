@@ -38,6 +38,7 @@ import logging
 import re
 
 from llm import content_words
+from servicenow import NOTE_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +295,7 @@ class TicketAgent:
         """Work one incident. `question` is the incident text; `prefetched` is an assistant result for
         it if the caller already has one (the demo). Returns a summary; writes go through self.desk."""
         time_left = time_left or (lambda: float("inf"))
-        state = {"searches": {}, "similar": None, "steps": [], "final": None,
+        state = {"searches": {}, "similar": None, "steps": [], "final": None, "calls": [],
                  "usage": {"input_tokens": 0, "output_tokens": 0}, "provider": "none"}
 
         first = prefetched or self.assistant.ask(question, time_left=time_left)
@@ -315,7 +316,7 @@ class TicketAgent:
                                 "The AI assistant was unavailable, so this needs a technician.", forced=True))
 
         messages = [{"role": "user", "content": self._prompt(incident, question, first)}]
-        for _ in range(self.max_steps):
+        for turn in range(self.max_steps):
             if time_left() < self.min_step_seconds:
                 if raise_on_model_error:  # let SQS retry (or the demo skip the plan) instead of guessing
                     raise AgentUnavailable("not enough time left for another step")
@@ -335,6 +336,7 @@ class TicketAgent:
                 break
             results = []
             for use in uses:
+                state["calls"].append({"name": str(use.get("name", "")), "input": use.get("input") or {}, "turn": turn})
                 output = self._dispatch(incident, question, state, use.get("name"), use.get("input") or {},
                                         time_left) if not state["final"] else {"error": "already finished"}
                 results.append({"type": "tool_result", "tool_use_id": use["id"], "content": json.dumps(output)})
@@ -606,7 +608,7 @@ class TicketAgent:
     def _finish(state, final) -> dict:
         first = state["searches"]["kb1"]
         return {**final, "steps": state["steps"], "usage": state["usage"], "provider": state["provider"],
-                "kb": first}
+                "kb": first, "calls": state.get("calls", [])}
 
     def finish_payload(self, outcome: dict) -> dict:
         """Extras for logs and the demo trace: which actions ran, simulated or live."""
@@ -734,12 +736,47 @@ class DryRunDesk:
         self.actions.append({"action": "link_parent", "parent": parent_number})
 
 
+MAX_PUBLIC_CALLS = 12
+
+
+def public_calls(calls: list) -> list[dict]:
+    """The model's tool calls, as the public demo may see them: tool names and short string arguments only
+    (synthetic data, secrets redacted). The demo page replays them through the same code to keep the ticket
+    interactive."""
+    from enterprise.framework import redact
+    out = []
+    for call in (calls or [])[:MAX_PUBLIC_CALLS]:
+        name = str(call.get("name", ""))
+        if not re.fullmatch(r"[a-z_]{1,40}", name):
+            continue
+        args = call.get("input") if isinstance(call.get("input"), dict) else {}
+        clean = {str(k)[:40]: str(v)[:400] for k, v in redact(args).items() if isinstance(v, (str, int, float, bool))}
+        turn = call.get("turn")
+        out.append({"name": name, "input": dict(list(clean.items())[:6]),
+                    "turn": turn if isinstance(turn, int) and 0 <= turn < 50 else 0})
+    return out
+
+
 def agent_plan(outcome: dict) -> dict:
-    """The part of an agent run that is safe to show the public: decision and steps, no internals."""
+    """The part of an agent run that is safe to show the public: decision, steps and the model's tool calls,
+    no internals."""
     return {"action": outcome.get("action"), "team": outcome.get("team"), "priority": outcome.get("priority"),
             "steps": [{"tool": s["tool"], "detail": s["detail"], "simulated": bool(s.get("simulated")),
                        "workflow": s.get("workflow")} for s in outcome.get("steps", [])],
-            "dry_run": True}
+            "calls": public_calls(outcome.get("calls")), "dry_run": True}
+
+
+def new_incident_check(incident: dict) -> str:
+    """Why a new-incident event should NOT be worked ("" = work it). Shared by the Lambda worker and the
+    public demo's sandbox, so a redelivered event never runs the agent twice."""
+    if str(incident.get("active", "true")).lower() == "false":
+        return "inactive"
+    notes = str(incident.get("work_notes") or "")
+    if AGENT_HEADER in notes or NOTE_HEADER in notes:
+        return "already_handled"
+    if str(incident.get("assigned_to") or "").strip():
+        return "technician_assigned"
+    return ""
 
 
 # ---------------------------------------------------------------- caller confirmation

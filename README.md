@@ -146,8 +146,9 @@ technician (In Progress, reply quoted in the work note). Live testing also found
 ServiceNow releases label customer comments "(Comments)" instead of "(Additional comments)", so replies
 were missed. Fixed, with a regression test built from the live instance's text.
 
-In the public demo you can play the caller after any answer ("it works", "still broken", or no reply)
-and watch the same policy code decide what happens next, as a dry run.
+In the public demo's AI ticket desk you can play the caller ("it works", "still broken", no reply) or the
+approver and watch the same policy code decide what happens next, on a demo ticket that never touches
+ServiceNow (see [Public demo](#public-demo)).
 
 #### When a ticket closes without the caller
 
@@ -265,8 +266,8 @@ from later edits, HR records readable by anyone, a security incident that could 
 after an unlock, a resolve while another action still waited for approval, and a caller reply that could
 be lost if it landed while the follow-up job was writing.
 
-Tests: `tests/test_enterprise.py` (55), `tests/test_followup.py` (38), `tests/test_lifecycle.py` (6) and `tests/test_agent.py` (26), 220 in
-the suite. They cover
+Tests: `tests/test_enterprise.py` (55), `tests/test_followup.py` (38), `tests/test_agent.py` (26),
+`tests/test_sandbox.py` (40), `tests/test_isolation.py` (5) and `tests/test_ui.py` (11), 270 in the suite. They cover
 success, permission denials, identity and approval gates, retries after throttling, timeouts (reads
 retried; writes never blindly repeated), duplicate requests (SQS redelivery), resumable lifecycle
 runs, escalation, the close-without-the-caller policy, and demo isolation.
@@ -368,6 +369,42 @@ the private integration above and built to be safe to leave running:
 | Same guardrails | PII masking, denied topics, prompt-attack filter, contextual grounding |
 | Spending alerts | AWS Budget on the account with email alerts at 50%, 80%, and 100% (and forecast 100%); plus a monthly spend limit in the Anthropic console and a small prepaid Voyage balance |
 
+### AI ticket desk
+
+The demo page's main section is an interactive ticket desk. A visitor opens an incident (one of seven
+samples, or their own text, up to 200 characters) and watches the agent work it: knowledge search, tool
+choice, identity and permission checks, simulated actions, read-back verification, then resolve, wait for
+the caller, or escalate. They can then play the caller (it worked, still broken, a coworker's comment, no
+reply: fast-forward a day for the 3-strike rule), play the approver (the requester trying to approve their
+own request is refused; the group owner's approval runs the action in code), or send the same event twice
+to see duplicate protection.
+
+What is real and what isn't:
+
+- **Real code:** the agent loop (`TicketAgent`), the ServiceNow desk adapter that writes work notes, comments,
+  state, group, priority and resolution fields, the caller-reply and approval handlers, the follow-up job
+  (3-strike rule), the enterprise framework (registry, policy, identity, approvals, executor, audit), and the
+  same idempotency checks the worker uses.
+- **Simulated:** every account, device, license and directory action runs on the simulated company in
+  `src/enterprise/sim.py` (fictional people) and is labeled SIMULATED on the page. The ticket is an in-memory
+  stand-in for the ServiceNow Table API (`src/sandbox.py`) that lives in the visitor's session.
+- **Whose decisions:** for sample incidents, the tool calls are a fixed script, replayed through the real
+  code. For a visitor's own text, the deployed `/demo/ask` route (same key, caps, guardrails and dry run as
+  the chat) runs the live model, which picks its own tools against the simulated company; the route returns
+  the tool names and short, redacted arguments, and the page replays them through the same code to build
+  the ticket. Results are never hard-coded: a policy refusal, an approval or a timeout comes from the policy
+  layer running the call.
+
+Why a visitor can't change a real system:
+
+| Boundary | Evidence |
+|---|---|
+| The page holds no ServiceNow URL, user or password, and no model key | Streamlit secrets are the demo API URL and key (plus optional profile links); `SandboxServiceNow` has no URL or credentials (`tests/test_sandbox.py`) |
+| The ticket desk makes no network calls | Tests run every sample and path with sockets and `urlopen` patched to fail |
+| Only simulated tools can run | Toolkits are built with `simulated_only=True`; the registry has no non-simulated tool (`isolation_report`, tested) |
+| The demo Lambda can't reach ServiceNow or the worker | `tests/test_isolation.py` reads `template.yaml`: no ServiceNow settings or secrets, no queue or state-table access, its own permissions are only `ssm:GetParameter` (its demo key) and `dynamodb:UpdateItem` (its usage counter), plus the shared read-only runtime policy (retrieval, model, guardrail, model and embedding keys); one route |
+| The demo key can't call private routes | `scripts/demo_security_check.py` against the deployed API |
+
 The daily cap is the hard ceiling. Since the demo also runs the ticket agent (several model calls per
 question), the default is 100 questions a day, and
 `scripts/demo_cost_report.py` reports the measured tokens and cost per question from the logs (and,
@@ -459,10 +496,13 @@ Claude Haiku 4.5, Bedrock Guardrail v5; 42 cases x 3 runs). Raw output:
 
 Retrieval (the right article's rank among the top 5):
 
-| Retriever | Direct questions (13) | Paraphrased questions (13) |
-|---|---|---|
-| **S3 Vectors + Voyage (semantic)** | **100%** hit@1 | **100%** hit@1, MRR 1.00 |
-| BM25 keyword baseline | 92% hit@1 | 62% hit@1, 77% hit@3, MRR 0.69 |
+| Retriever | All questions (26) | Direct (13) | Paraphrased (13) |
+|---|---|---|---|
+| **S3 Vectors + Voyage (semantic)** | **100%** hit@1, MRR 1.00 | **100%** hit@1 | **100%** hit@1, MRR 1.00 |
+| BM25 keyword baseline | 77% hit@1, MRR 0.83 | 92% hit@1 | 62% hit@1, 77% hit@3, MRR 0.69 |
+
+All three columns are from the same run: the 26 answer questions split into 13 that use the article's
+words and 13 paraphrased. The demo page's headline uses the 26-question figure (100% vs 77%).
 
 End to end: **123 / 126 passed (98%)**
 
@@ -591,7 +631,9 @@ src/           assistant pipeline, retrievers, guardrails, models (incl. tool us
 src/enterprise framework.py (registry, policy, approvals, executor, audit), workflows.py (the 12
                workflows as tools), sim.py (simulated backends), loganalysis.py, runtime.py
 servicenow/    Business Rule scripts (new incident, caller reply, approval decision) and exported update set
-ui/app.py      Streamlit chat (local or deployed mode)
+src/sandbox.py AI ticket desk for the public demo (in-memory ticket, samples, replay of the live model's calls)
+src/showcase.py capability catalog and eval summary shown on the demo page
+ui/app.py      Streamlit demo page and chat (local, deployed or public demo mode)
 evals/         golden set + eval runner
 scripts/       build_index.py, sync_vectors.py, sync_kb.py, ask.py,
                servicenow_setup.py, servicenow_eval.py,

@@ -275,7 +275,8 @@ def test_worker_retries_when_the_model_is_down_then_escalates(monkeypatch):
 def test_agent_plan_is_safe_to_show_publicly():
     out, _ = run(FakeLLM(), answered())
     plan = agent_plan(out)
-    assert set(plan) == {"action", "team", "priority", "steps", "dry_run"} and plan["dry_run"] is True
+    assert set(plan) == {"action", "team", "priority", "steps", "calls", "dry_run"} and plan["dry_run"] is True
+    assert all(set(c) == {"name", "input", "turn"} for c in plan["calls"])
     assert "kb" not in plan and "usage" not in plan
 
 

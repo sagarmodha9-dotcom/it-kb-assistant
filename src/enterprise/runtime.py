@@ -53,15 +53,24 @@ def demo_llm(llm):
     return clone
 
 
+def _ran(kit) -> list[dict]:
+    """What the approved run executed, with each action's verified summary (no arguments: logs stay small)."""
+    summaries = {e.get("tool"): (e.get("result") or {}).get("summary", "") for e in kit.ctx.audit.entries
+                 if e.get("action") == "executed"}
+    return [{"tool": e["tool"], "workflow": e["workflow"], "simulated": e["simulated"],
+             "verifies_fix": e.get("verifies_fix", False), "summary": summaries.get(e["tool"], "")}
+            for e in kit.ctx.executed]
+
+
 def handle_approval_decision(desk, incident: dict, approver: str, approved: bool, store, backends=None,
-                             resolve_simulated: bool = False) -> dict:
+                             resolve_simulated: bool = False, simulated_only: bool = False) -> dict:
     """Run (or cancel) every pending approval on this incident after an approver's decision."""
     ticket = str(incident.get("number") or "")
     pending = (store.get(f"pending#{ticket}") or {"ids": []})["ids"]
     if not pending:
         return {"outcome": "no_pending_approval"}
     caller = caller_id(incident)
-    kit = build_toolkit(ticket, caller, store=store, backends=backends)
+    kit = build_toolkit(ticket, caller, store=store, backends=backends, simulated_only=simulated_only)
     results = []
     for approval_id in pending:
         try:
@@ -97,7 +106,7 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
         steps = [f"- approved by {approver}"] + [f"- {e['action']}: {e.get('tool', '')}" for e in kit.ctx.audit.entries]
         comment, note, close_notes = verified_resolution(kit.ctx.caller_messages, kit.ctx.executed, steps)
         desk.resolve(incident, comment=comment, work_note=note, close_notes=close_notes, team=DEFAULT_TEAM)
-        return {"outcome": "executed_resolved", "results": results}
+        return {"outcome": "executed_resolved", "results": results, "executed": _ran(kit)}
     if done and not failed:
         comment = "\n".join([AI_COMMENT_START + ". Your request was approved and completed:", "",
                              *simulation_notice(kit.ctx.executed), *action_lines(kit.ctx.caller_messages, kit.ctx.executed), "",
@@ -109,7 +118,7 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
         # keep the ticket with whoever owns it now (Security, another team); only an unowned one goes to the Service Desk
         desk.send_fix(incident, comment=comment, work_note=note,
                       team=DEFAULT_TEAM if with_service_desk(incident, desk) else None)
-        return {"outcome": "executed_awaiting_caller", "results": results}
+        return {"outcome": "executed_awaiting_caller", "results": results, "executed": _ran(kit)}
     if rejected:
         desk.back_to_technician(incident, DEFAULT_TEAM, "\n".join([AGENT_HEADER, f"Rejected by {approver}.", "", audit]),
                                 comment=f"{AI_COMMENT_START}. Your request was not approved by {approver}. "

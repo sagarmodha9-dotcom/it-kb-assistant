@@ -30,9 +30,9 @@ import time
 
 from assistant import MAX_QUESTION
 from factory import build_assistant, build_guardrail
-from agent import (AGENT_HEADER, AgentUnavailable, DryRunDesk, ServiceNowDesk, TicketAgent, agent_plan,
-                   handle_caller_reply)
-from servicenow import (NOTE_HEADER, NUMBER, SYS_ID, RetryLater, ServiceNowClient, ServiceNowError,
+from agent import (AgentUnavailable, DryRunDesk, ServiceNowDesk, TicketAgent, agent_plan, handle_caller_reply,
+                   new_incident_check)
+from servicenow import (NUMBER, SYS_ID, RetryLater, ServiceNowClient, ServiceNowError,
                         incident_question, process_incident)
 from tickets import TicketClient, TicketError
 
@@ -319,11 +319,9 @@ def work_incident(client, assistant, sys_id: str, kind: str = "new", time_left=N
         except AgentUnavailable as error:
             raise RetryLater(f"reply on {number}: {error}") from error
         return {"sys_id": sys_id, "number": number, "kind": kind, **handled}
-    notes = str(incident.get("work_notes") or "")
-    if AGENT_HEADER in notes or NOTE_HEADER in notes:
-        return {"sys_id": sys_id, "number": number, "outcome": "already_handled"}
-    if str(incident.get("assigned_to") or "").strip():
-        return {"sys_id": sys_id, "number": number, "outcome": "technician_assigned"}
+    skip = new_incident_check(incident)
+    if skip:
+        return {"sys_id": sys_id, "number": number, "outcome": skip}
     question = incident_question(incident)
     if not question:
         return {"sys_id": sys_id, "number": number, "outcome": "empty"}
