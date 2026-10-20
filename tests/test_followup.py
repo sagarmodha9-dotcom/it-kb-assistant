@@ -267,3 +267,24 @@ def test_a_reply_landing_as_the_ai_resolves_still_reopens():
                             + rest)                         # ...but the caller wrote just before it
     follow = DryRunDesk()
     assert handle_caller_reply(FakeLLM(), build_guardrail({}), follow, incident)["outcome"] == "reopened"
+
+
+# Copied from a live ServiceNow instance (Australia release): customer comments are labeled "(Comments)".
+LIVE_JOURNAL = ("2026-10-19 20:27:40 - Alex Rivera (Comments)\nStill can't sign in\n\n"
+                "2026-10-19 20:16:37 - KB Assistant (AI integration) (Comments)\n"
+                "Hi, this is the IT help desk's AI assistant, with an update. Here's what we did:\n\n"
+                "- Your account has been unlocked. Please sign in again with your current password.\n\n"
+                "We checked the change in the simulated directory and it's in place, so we've resolved this ticket. "
+                "If anything's still not working, just reply here and the ticket reopens for a technician.\n\n")
+
+
+def test_live_servicenow_journal_format_is_read():
+    from agent import latest_caller_reply
+    reply = latest_caller_reply(LIVE_JOURNAL, skip=("x",))
+    assert reply == {"at": "2026-10-19 20:27:40", "author": "Alex Rivera", "text": "Still can't sign in"}
+    incident = {"sys_id": SYS_ID, "state": "Resolved", "caller_id": "Alex Rivera", "assigned_to": "",
+                "close_notes": RESOLVED_MARKER + ": verified fix (unlock_account)", "comments": LIVE_JOURNAL,
+                "work_notes": ""}
+    desk = DryRunDesk()
+    assert handle_caller_reply(FakeLLM(), build_guardrail({}), desk, incident)["outcome"] == "reopened"
+    assert desk.actions[0]["action"] == "back_to_technician"
