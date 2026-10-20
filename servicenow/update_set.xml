@@ -1,0 +1,283 @@
+<?xml version="1.0" encoding="UTF-8"?><unload unload_date="2026-10-20 02:22:53">
+<sys_remote_update_set action="INSERT_OR_UPDATE">
+<application display_value="Global">global</application>
+<application_name>Global</application_name>
+<application_scope>global</application_scope>
+<application_version/>
+<collisions/>
+<commit_date/>
+<deleted/>
+<description>Business Rule and properties for the IT KB Assistant integration.</description>
+<inserted/>
+<name>KB Assistant Integration</name>
+<origin_sys_id/>
+<parent display_value=""/>
+<release_date/>
+<remote_base_update_set display_value=""/>
+<remote_parent_id/>
+<remote_sys_id>0a4f061d73c0d71048fffb914ab8b7e9</remote_sys_id>
+<state>loaded</state>
+<summary/>
+<sys_class_name>sys_remote_update_set</sys_class_name>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2026-10-20 02:22:46</sys_created_on>
+<sys_id>daaf44a973001b1048fffb914ab8b761</sys_id>
+<sys_mod_count>0</sys_mod_count>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2026-10-20 02:22:46</sys_updated_on>
+<update_set display_value=""/>
+<update_source display_value=""/>
+<updated/>
+</sys_remote_update_set>
+<sys_update_xml action="INSERT_OR_UPDATE">
+<action>INSERT_OR_UPDATE</action>
+<application display_value="Global">global</application>
+<category>customer</category>
+<comments/>
+<name>sys_script_fe501e5d73c0d71048fffb914ab8b784</name>
+<payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update sys_domain="global" table="sys_script"&gt;&lt;sys_script action="INSERT_OR_UPDATE"&gt;&lt;abort_action&gt;false&lt;/abort_action&gt;&lt;access&gt;package_private&lt;/access&gt;&lt;action_delete&gt;false&lt;/action_delete&gt;&lt;action_insert&gt;true&lt;/action_insert&gt;&lt;action_query&gt;false&lt;/action_query&gt;&lt;action_update&gt;false&lt;/action_update&gt;&lt;active&gt;true&lt;/active&gt;&lt;add_message&gt;false&lt;/add_message&gt;&lt;advanced&gt;true&lt;/advanced&gt;&lt;change_fields&gt;false&lt;/change_fields&gt;&lt;client_callable&gt;false&lt;/client_callable&gt;&lt;collection&gt;incident&lt;/collection&gt;&lt;condition/&gt;&lt;description&gt;Sends new incidents to the IT KB Assistant ticket agent (AWS).&lt;/description&gt;&lt;execute_function&gt;false&lt;/execute_function&gt;&lt;filter_condition/&gt;&lt;is_rest&gt;false&lt;/is_rest&gt;&lt;message/&gt;&lt;name&gt;KB Assistant - AI work note&lt;/name&gt;&lt;order&gt;1000&lt;/order&gt;&lt;priority&gt;100&lt;/priority&gt;&lt;rest_method/&gt;&lt;rest_method_text/&gt;&lt;rest_service/&gt;&lt;rest_service_text/&gt;&lt;rest_variables/&gt;&lt;role_conditions/&gt;&lt;script&gt;&lt;![CDATA[/**
+ * Business Rule: "KB Assistant - AI work note"
+ * Table: incident | Insert: true | When: async_always (background job queue, so saving never waits)
+ *   or after (runs right after the save; the webhook only queues and answers in under a second, and the
+ *   5-second timeout below caps the worst case). Use "after" if the instance's job queue is backlogged.
+ *
+ * Sends only the incident's sys_id and number to the AWS webhook. The worker then reads the incident
+ * itself through the Table API, so no incident text travels in this request.
+ * The request is signed: HMAC-SHA256 over "&lt;timestamp&gt;.&lt;body&gt;" with the shared key, which AWS
+ * verifies (and rejects anything older than 5 minutes).
+ *
+ * System properties (created by scripts/servicenow_setup.py):
+ *   kb_assistant.webhook_url   the stack's ServiceNowWebhookUrl output
+ *   kb_assistant.signing_key   base64 HMAC key (marked Private, so it is never exported in update sets)
+ */
+(function executeRule(current, previous /* null when async */) {
+    var endpoint = gs.getProperty('kb_assistant.webhook_url', '');
+    var key = gs.getProperty('kb_assistant.signing_key', '');
+    if (!endpoint || !key) {
+        gs.warn('KB Assistant: webhook URL or signing key is not configured; skipping ' + current.getValue('number'));
+        return;
+    }
+    var body = JSON.stringify({ sys_id: current.getUniqueValue(), number: current.getValue('number') });
+    var timestamp = String(Math.floor(new GlideDateTime().getNumericValue() / 1000));
+    var signature = new GlideCertificateEncryption().generateMac(key, 'HmacSHA256', timestamp + '.' + body);
+
+    try {
+        var request = new sn_ws.RESTMessageV2();
+        request.setEndpoint(endpoint);
+        request.setHttpMethod('post');
+        request.setHttpTimeout(5000);
+        request.setRequestHeader('Content-Type', 'application/json');
+        request.setRequestHeader('X-Timestamp', timestamp);
+        request.setRequestHeader('X-Signature', signature);
+        request.setRequestBody(body);
+        var response = request.execute();
+        var status = response.getStatusCode();
+        if (status != 202 &amp;&amp; status != 200) {
+            gs.warn('KB Assistant webhook returned HTTP ' + status + ' for ' + current.getValue('number') +
+                    ': ' + response.getBody());
+        }
+    } catch (e) {
+        // Never block or break the incident: log and move on. The incident works normally without AI.
+        gs.error('KB Assistant webhook failed for ' + current.getValue('number') + ': ' + e);
+    }
+})(current, previous);
+]]&gt;&lt;/script&gt;&lt;sys_class_name&gt;sys_script&lt;/sys_class_name&gt;&lt;sys_created_by&gt;svc_kb_setup&lt;/sys_created_by&gt;&lt;sys_created_on&gt;2026-10-19 17:06:34&lt;/sys_created_on&gt;&lt;sys_domain&gt;global&lt;/sys_domain&gt;&lt;sys_domain_path&gt;/&lt;/sys_domain_path&gt;&lt;sys_id&gt;fe501e5d73c0d71048fffb914ab8b784&lt;/sys_id&gt;&lt;sys_mod_count&gt;2&lt;/sys_mod_count&gt;&lt;sys_name&gt;KB Assistant - AI work note&lt;/sys_name&gt;&lt;sys_overrides/&gt;&lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;&lt;sys_policy/&gt;&lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;&lt;sys_update_name&gt;sys_script_fe501e5d73c0d71048fffb914ab8b784&lt;/sys_update_name&gt;&lt;sys_updated_by&gt;svc_kb_setup&lt;/sys_updated_by&gt;&lt;sys_updated_on&gt;2026-10-19 23:17:50&lt;/sys_updated_on&gt;&lt;template/&gt;&lt;when&gt;after&lt;/when&gt;&lt;/sys_script&gt;&lt;sys_translated_text action="delete_multiple" query="documentkey=fe501e5d73c0d71048fffb914ab8b784"/&gt;&lt;/record_update&gt;</payload>
+<payload_hash>900510490</payload_hash>
+<remote_update_set display_value="KB Assistant Integration">daaf44a973001b1048fffb914ab8b761</remote_update_set>
+<replace_on_upgrade>false</replace_on_upgrade>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2026-10-20 02:22:46</sys_created_on>
+<sys_id>26afc42173401b1048fffb914ab8b794</sys_id>
+<sys_mod_count>0</sys_mod_count>
+<sys_recorded_at>1a1567503030000001</sys_recorded_at>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2026-10-20 02:22:46</sys_updated_on>
+<table>incident</table>
+<target_name>KB Assistant - AI work note</target_name>
+<type>Business Rule</type>
+<update_domain>global</update_domain>
+<update_guid>e5556b99430cd7106c16e59f68d14e88</update_guid>
+<update_guid_history>e5556b99430cd7106c16e59f68d14e88:900510490,ce7c52d15644d7108b8c00e2a4d91ce7:-1177909607,5350d69d7ec0d71041bc609cc8ebe5a2:1035671168</update_guid_history>
+<update_set display_value=""/>
+<view/>
+</sys_update_xml>
+<sys_update_xml action="INSERT_OR_UPDATE">
+<action>INSERT_OR_UPDATE</action>
+<application display_value="Global">global</application>
+<category>customer</category>
+<comments/>
+<name>sys_properties_82656b99730cd71048fffb914ab8b759</name>
+<payload><![CDATA[<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_properties"><sys_properties action="INSERT_OR_UPDATE"><choices/><description>The KB Assistant service account; its own comments never trigger the reply rule.</description><ignore_cache>false</ignore_cache><is_private>false</is_private><name>kb_assistant.service_user</name><read_roles/><suffix/><sys_class_name>sys_properties</sys_class_name><sys_created_by>svc_kb_setup</sys_created_by><sys_created_on>2026-10-19 23:18:09</sys_created_on><sys_id>82656b99730cd71048fffb914ab8b759</sys_id><sys_mod_count>0</sys_mod_count><sys_name>kb_assistant.service_user</sys_name><sys_package display_value="Global" source="global">global</sys_package><sys_policy/><sys_scope display_value="Global">global</sys_scope><sys_update_name>sys_properties_82656b99730cd71048fffb914ab8b759</sys_update_name><sys_updated_by>svc_kb_setup</sys_updated_by><sys_updated_on>2026-10-19 23:18:09</sys_updated_on><type>string</type><value>svc_kb_assistant</value><write_roles/></sys_properties><sys_translated_text action="delete_multiple" query="documentkey=82656b99730cd71048fffb914ab8b759"/></record_update>]]></payload>
+<payload_hash>1388659963</payload_hash>
+<remote_update_set display_value="KB Assistant Integration">daaf44a973001b1048fffb914ab8b761</remote_update_set>
+<replace_on_upgrade>false</replace_on_upgrade>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2026-10-20 02:22:46</sys_created_on>
+<sys_id>66afc42173401b1048fffb914ab8b793</sys_id>
+<sys_mod_count>0</sys_mod_count>
+<sys_recorded_at>1a1567572160000001</sys_recorded_at>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2026-10-20 02:22:46</sys_updated_on>
+<table/>
+<target_name>kb_assistant.service_user</target_name>
+<type>System Property</type>
+<update_domain>global</update_domain>
+<update_guid>60756f99ef0cd7101677bd091e346492</update_guid>
+<update_guid_history>60756f99ef0cd7101677bd091e346492:1388659963</update_guid_history>
+<update_set display_value=""/>
+<view/>
+</sys_update_xml>
+<sys_update_xml action="INSERT_OR_UPDATE">
+<action>INSERT_OR_UPDATE</action>
+<application display_value="Global">global</application>
+<category>customer</category>
+<comments/>
+<name>sys_script_16556b99730cd71048fffb914ab8b7d5</name>
+<payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update sys_domain="global" table="sys_script"&gt;&lt;sys_script action="INSERT_OR_UPDATE"&gt;&lt;abort_action&gt;false&lt;/abort_action&gt;&lt;access&gt;package_private&lt;/access&gt;&lt;action_delete&gt;false&lt;/action_delete&gt;&lt;action_insert&gt;false&lt;/action_insert&gt;&lt;action_query&gt;false&lt;/action_query&gt;&lt;action_update&gt;true&lt;/action_update&gt;&lt;active&gt;true&lt;/active&gt;&lt;add_message&gt;false&lt;/add_message&gt;&lt;advanced&gt;true&lt;/advanced&gt;&lt;change_fields&gt;false&lt;/change_fields&gt;&lt;client_callable&gt;false&lt;/client_callable&gt;&lt;collection&gt;incident&lt;/collection&gt;&lt;condition/&gt;&lt;description&gt;When the caller replies to the AI agent's fix, lets the agent resolve or hand it back.&lt;/description&gt;&lt;execute_function&gt;false&lt;/execute_function&gt;&lt;filter_condition/&gt;&lt;is_rest&gt;false&lt;/is_rest&gt;&lt;message/&gt;&lt;name&gt;KB Assistant - caller reply&lt;/name&gt;&lt;order&gt;1000&lt;/order&gt;&lt;priority&gt;100&lt;/priority&gt;&lt;rest_method/&gt;&lt;rest_method_text/&gt;&lt;rest_service/&gt;&lt;rest_service_text/&gt;&lt;rest_variables/&gt;&lt;role_conditions/&gt;&lt;script&gt;&lt;![CDATA[/**
+ * Business Rule: "KB Assistant - caller reply"
+ * Table: incident | Update: true | When: after (needs `previous`, which async rules don't have)
+ *
+ * When the AI agent has sent a fix and put the incident On Hold - Awaiting Caller, and the caller
+ * then adds a comment, tell AWS so the agent can read the reply: confirmed -&gt; Resolved, anything
+ * else -&gt; back to a technician. Signed exactly like the new-incident rule; only ids are sent.
+ * Fires only for the caller's own comments; AWS re-checks the author against the caller.
+ */
+(function executeRule(current, previous) {
+    if (!previous || !current.comments.changes()) return;
+    if (previous.getValue('state') != '3' || previous.getValue('hold_reason') != '1') return;  // On Hold - Awaiting Caller
+    if (gs.getUserName() == gs.getProperty('kb_assistant.service_user', 'svc_kb_assistant')) return;  // our own comment
+    if (gs.getUserID() != current.getValue('caller_id')) return;  // only the caller can confirm their fix (AWS checks again)
+
+    var endpoint = gs.getProperty('kb_assistant.webhook_url', '');
+    var key = gs.getProperty('kb_assistant.signing_key', '');
+    if (!endpoint || !key) return;
+    var body = JSON.stringify({ sys_id: current.getUniqueValue(), number: current.getValue('number'),
+                                event: 'caller_reply', version: String(current.getValue('sys_mod_count')) });
+    var timestamp = String(Math.floor(new GlideDateTime().getNumericValue() / 1000));
+    var signature = new GlideCertificateEncryption().generateMac(key, 'HmacSHA256', timestamp + '.' + body);
+    try {
+        var request = new sn_ws.RESTMessageV2();
+        request.setEndpoint(endpoint);
+        request.setHttpMethod('post');
+        request.setHttpTimeout(5000);
+        request.setRequestHeader('Content-Type', 'application/json');
+        request.setRequestHeader('X-Timestamp', timestamp);
+        request.setRequestHeader('X-Signature', signature);
+        request.setRequestBody(body);
+        request.executeAsync();  // don't make the caller's save wait on AWS
+    } catch (e) {
+        gs.error('KB Assistant reply webhook failed for ' + current.getValue('number') + ': ' + e);
+    }
+})(current, previous);
+]]&gt;&lt;/script&gt;&lt;sys_class_name&gt;sys_script&lt;/sys_class_name&gt;&lt;sys_created_by&gt;svc_kb_setup&lt;/sys_created_by&gt;&lt;sys_created_on&gt;2026-10-19 23:17:54&lt;/sys_created_on&gt;&lt;sys_domain&gt;global&lt;/sys_domain&gt;&lt;sys_domain_path&gt;/&lt;/sys_domain_path&gt;&lt;sys_id&gt;16556b99730cd71048fffb914ab8b7d5&lt;/sys_id&gt;&lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;&lt;sys_name&gt;KB Assistant - caller reply&lt;/sys_name&gt;&lt;sys_overrides/&gt;&lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;&lt;sys_policy/&gt;&lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;&lt;sys_update_name&gt;sys_script_16556b99730cd71048fffb914ab8b7d5&lt;/sys_update_name&gt;&lt;sys_updated_by&gt;svc_kb_setup&lt;/sys_updated_by&gt;&lt;sys_updated_on&gt;2026-10-19 23:17:54&lt;/sys_updated_on&gt;&lt;template/&gt;&lt;when&gt;after&lt;/when&gt;&lt;/sys_script&gt;&lt;sys_translated_text action="delete_multiple" query="documentkey=16556b99730cd71048fffb914ab8b7d5"/&gt;&lt;/record_update&gt;</payload>
+<payload_hash>-516008954</payload_hash>
+<remote_update_set display_value="KB Assistant Integration">daaf44a973001b1048fffb914ab8b761</remote_update_set>
+<replace_on_upgrade>false</replace_on_upgrade>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2026-10-20 02:22:46</sys_created_on>
+<sys_id>aaafc42173401b1048fffb914ab8b793</sys_id>
+<sys_mod_count>0</sys_mod_count>
+<sys_recorded_at>1a156753eaa0000001</sys_recorded_at>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2026-10-20 02:22:46</sys_updated_on>
+<table>incident</table>
+<target_name>KB Assistant - caller reply</target_name>
+<type>Business Rule</type>
+<update_domain>global</update_domain>
+<update_guid>5565ab99310cd7107344209c23b71b18</update_guid>
+<update_guid_history>5565ab99310cd7107344209c23b71b18:-516008954</update_guid_history>
+<update_set display_value=""/>
+<view/>
+</sys_update_xml>
+<sys_update_xml action="INSERT_OR_UPDATE">
+<action>INSERT_OR_UPDATE</action>
+<application display_value="Global">global</application>
+<category>customer</category>
+<comments/>
+<name>sys_properties_7200925d73c0d71048fffb914ab8b765</name>
+<payload><![CDATA[<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_properties"><sys_properties action="INSERT_OR_UPDATE"><choices/><description>AWS endpoint that receives new-incident events for the KB Assistant.</description><ignore_cache>false</ignore_cache><is_private>false</is_private><name>kb_assistant.webhook_url</name><read_roles/><suffix/><sys_class_name>sys_properties</sys_class_name><sys_created_by>svc_kb_setup</sys_created_by><sys_created_on>2026-10-19 17:05:12</sys_created_on><sys_id>7200925d73c0d71048fffb914ab8b765</sys_id><sys_mod_count>0</sys_mod_count><sys_name>kb_assistant.webhook_url</sys_name><sys_package display_value="Global" source="global">global</sys_package><sys_policy/><sys_scope display_value="Global">global</sys_scope><sys_update_name>sys_properties_7200925d73c0d71048fffb914ab8b765</sys_update_name><sys_updated_by>svc_kb_setup</sys_updated_by><sys_updated_on>2026-10-19 17:05:12</sys_updated_on><type>string</type><value>https://z0vm036qia.execute-api.us-west-2.amazonaws.com/servicenow/events</value><write_roles/></sys_properties><sys_translated_text action="delete_multiple" query="documentkey=7200925d73c0d71048fffb914ab8b765"/></record_update>]]></payload>
+<payload_hash>-96916643</payload_hash>
+<remote_update_set display_value="KB Assistant Integration">daaf44a973001b1048fffb914ab8b761</remote_update_set>
+<replace_on_upgrade>false</replace_on_upgrade>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2026-10-20 02:22:46</sys_created_on>
+<sys_id>d6afc42173401b1048fffb914ab8b792</sys_id>
+<sys_mod_count>0</sys_mod_count>
+<sys_recorded_at>1a15520364b0000001</sys_recorded_at>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2026-10-20 02:22:46</sys_updated_on>
+<table/>
+<target_name>kb_assistant.webhook_url</target_name>
+<type>System Property</type>
+<update_domain>global</update_domain>
+<update_guid>3020de5dd2c0d71049dc4b26d44b5abd</update_guid>
+<update_guid_history>3020de5dd2c0d71049dc4b26d44b5abd:-96916643</update_guid_history>
+<update_set display_value=""/>
+<view/>
+</sys_update_xml>
+<sys_update_xml action="INSERT_OR_UPDATE">
+<action>INSERT_OR_UPDATE</action>
+<application display_value="Global">global</application>
+<category>customer</category>
+<comments/>
+<name>sys_script_78b567d9730cd71048fffb914ab8b753</name>
+<payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update sys_domain="global" table="sys_script"&gt;&lt;sys_script action="INSERT_OR_UPDATE"&gt;&lt;abort_action&gt;false&lt;/abort_action&gt;&lt;access&gt;package_private&lt;/access&gt;&lt;action_delete&gt;false&lt;/action_delete&gt;&lt;action_insert&gt;false&lt;/action_insert&gt;&lt;action_query&gt;false&lt;/action_query&gt;&lt;action_update&gt;true&lt;/action_update&gt;&lt;active&gt;true&lt;/active&gt;&lt;add_message&gt;false&lt;/add_message&gt;&lt;advanced&gt;true&lt;/advanced&gt;&lt;change_fields&gt;false&lt;/change_fields&gt;&lt;client_callable&gt;false&lt;/client_callable&gt;&lt;collection&gt;incident&lt;/collection&gt;&lt;condition/&gt;&lt;description&gt;When an approver approves or rejects an AI agent request, runs or cancels it.&lt;/description&gt;&lt;execute_function&gt;false&lt;/execute_function&gt;&lt;filter_condition/&gt;&lt;is_rest&gt;false&lt;/is_rest&gt;&lt;message/&gt;&lt;name&gt;KB Assistant - approval decision&lt;/name&gt;&lt;order&gt;1000&lt;/order&gt;&lt;priority&gt;100&lt;/priority&gt;&lt;rest_method/&gt;&lt;rest_method_text/&gt;&lt;rest_service/&gt;&lt;rest_service_text/&gt;&lt;rest_variables/&gt;&lt;role_conditions/&gt;&lt;script&gt;&lt;![CDATA[/**
+ * Business Rule: "KB Assistant - approval decision"
+ * Table: incident | Update: true | When: after
+ *
+ * When the AI agent has asked for approval (Approval = Requested) and an approver sets Approval to
+ * Approved or Rejected, tell AWS who decided and what (signed). Recommended: an ACL so only approver
+ * roles can write the incident's Approval field. The worker checks that this person is an authorized approver for
+ * that request (right role, not the requester), then runs exactly the approved action, or tells the
+ * caller it was rejected. Signed like the other rules; only ids are sent.
+ */
+(function executeRule(current, previous) {
+    if (!previous || !current.approval.changes() || previous.getValue('approval') != 'requested') return;
+    var decision = current.getValue('approval');
+    if (decision != 'approved' &amp;&amp; decision != 'rejected') return;
+    // The person who made this change, captured now and signed: AWS never infers it from later edits.
+    var approver = gs.getUserName();
+
+    var endpoint = gs.getProperty('kb_assistant.webhook_url', '');
+    var key = gs.getProperty('kb_assistant.signing_key', '');
+    if (!endpoint || !key) return;
+    var body = JSON.stringify({ sys_id: current.getUniqueValue(), number: current.getValue('number'),
+                                event: 'approval', version: String(current.getValue('sys_mod_count')),
+                                decision: decision, approver: approver });
+    var timestamp = String(Math.floor(new GlideDateTime().getNumericValue() / 1000));
+    var signature = new GlideCertificateEncryption().generateMac(key, 'HmacSHA256', timestamp + '.' + body);
+    try {
+        var request = new sn_ws.RESTMessageV2();
+        request.setEndpoint(endpoint);
+        request.setHttpMethod('post');
+        request.setHttpTimeout(5000);
+        request.setRequestHeader('Content-Type', 'application/json');
+        request.setRequestHeader('X-Timestamp', timestamp);
+        request.setRequestHeader('X-Signature', signature);
+        request.setRequestBody(body);
+        request.executeAsync();
+    } catch (e) {
+        gs.error('KB Assistant approval webhook failed for ' + current.getValue('number') + ': ' + e);
+    }
+})(current, previous);
+]]&gt;&lt;/script&gt;&lt;sys_class_name&gt;sys_script&lt;/sys_class_name&gt;&lt;sys_created_by&gt;svc_kb_setup&lt;/sys_created_by&gt;&lt;sys_created_on&gt;2026-10-19 23:19:27&lt;/sys_created_on&gt;&lt;sys_domain&gt;global&lt;/sys_domain&gt;&lt;sys_domain_path&gt;/&lt;/sys_domain_path&gt;&lt;sys_id&gt;78b567d9730cd71048fffb914ab8b753&lt;/sys_id&gt;&lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;&lt;sys_name&gt;KB Assistant - approval decision&lt;/sys_name&gt;&lt;sys_overrides/&gt;&lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;&lt;sys_policy/&gt;&lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;&lt;sys_update_name&gt;sys_script_78b567d9730cd71048fffb914ab8b753&lt;/sys_update_name&gt;&lt;sys_updated_by&gt;svc_kb_setup&lt;/sys_updated_by&gt;&lt;sys_updated_on&gt;2026-10-19 23:19:27&lt;/sys_updated_on&gt;&lt;template/&gt;&lt;when&gt;after&lt;/when&gt;&lt;/sys_script&gt;&lt;sys_translated_text action="delete_multiple" query="documentkey=78b567d9730cd71048fffb914ab8b753"/&gt;&lt;/record_update&gt;</payload>
+<payload_hash>772429908</payload_hash>
+<remote_update_set display_value="KB Assistant Integration">daaf44a973001b1048fffb914ab8b761</remote_update_set>
+<replace_on_upgrade>false</replace_on_upgrade>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2026-10-20 02:22:46</sys_created_on>
+<sys_id>eeafc42173401b1048fffb914ab8b793</sys_id>
+<sys_mod_count>0</sys_mod_count>
+<sys_recorded_at>1a156767f7a0000001</sys_recorded_at>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2026-10-20 02:22:46</sys_updated_on>
+<table>incident</table>
+<target_name>KB Assistant - approval decision</target_name>
+<type>Business Rule</type>
+<update_domain>global</update_domain>
+<update_guid>95b567d9e50cd71032f6763c935ee55c</update_guid>
+<update_guid_history>95b567d9e50cd71032f6763c935ee55c:772429908</update_guid_history>
+<update_set display_value=""/>
+<view/>
+</sys_update_xml>
+</unload>
