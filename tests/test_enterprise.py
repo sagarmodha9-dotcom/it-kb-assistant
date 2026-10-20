@@ -317,6 +317,7 @@ def test_wf12_verified_unlock_resolves_right_away_and_a_reply_reopens_it():
     assert action["action"] == "resolve" and action["close_notes"].startswith(RESOLVED_MARKER)
     assert "unlocked" in action["comment"] and REOPEN_INVITE in action["comment"]
     assert action["comment"].index(SIMULATED_NOTICE) < action["comment"].index("unlocked")   # said up front
+    assert "- [Simulated, no real change] Your account has been unlocked" in action["comment"]   # and on the line itself
     assert "SIMULATED" in action["work_note"] and CONFIRM_MARKER not in action["work_note"]
     resolved = {**incident, "state": "Resolved", "caller_id": "Alex Rivera", "work_notes": action["work_note"],
                 "close_notes": action["close_notes"]}
@@ -346,6 +347,7 @@ def test_simulated_evidence_never_closes_a_ticket_by_default():
     desk = DryRunDesk()
     out = TicketAgent(Scripted(*script), Assistant(NO_ANSWER), desk, toolkit=live).run(incident, "x")
     assert out["action"] == "resolved" and SIMULATED_NOTICE not in desk.actions[0]["comment"]
+    assert "[Simulated" not in desk.actions[0]["comment"]
     assert "SIMULATED" not in desk.actions[0]["close_notes"]
 
 

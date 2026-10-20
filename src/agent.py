@@ -51,7 +51,7 @@ FIX_MARKER = "Action: sent a knowledge base fix to the caller"
 CONFIRM_MARKER = "Waiting for the caller to confirm"   # in every note that hands the caller something to confirm
 RESOLVED_MARKER = "Resolved by the AI agent"            # starts close notes (and a note line) when the AI resolves
 REOPEN_INVITE = "If anything's still not working, just reply here and the ticket reopens for a technician."
-SIMULATED_NOTICE = ("Test environment: these actions ran against a simulated company directory "
+SIMULATED_NOTICE = ("Demo only: the agent ran these steps against a simulated company directory "
                     "(not a real Entra ID, Intune or Microsoft 365 tenant). No real account, device or license was changed.")
 
 
@@ -62,6 +62,13 @@ def simulated(executed: list[dict]) -> bool:
 def simulation_notice(executed: list[dict]) -> list[str]:
     """Lines the caller sees first whenever a simulated backend ran, so a test never reads as a real change."""
     return [SIMULATED_NOTICE, ""] if simulated(executed) else []
+
+
+def action_lines(caller_messages: list[str], executed: list[dict]) -> list[str]:
+    """What the caller is told was done. On the simulated directory every line says so, so no sentence like
+    "your account has been unlocked" can be read on its own as a real change."""
+    tag = "[Simulated, no real change] " if simulated(executed) else ""
+    return [f"- {tag}{m}" for m in caller_messages]
 
 
 def executed_lines(executed: list[dict]) -> list[str]:
@@ -252,7 +259,7 @@ def verified_resolution(caller_messages: list[str], executed: list[dict], step_l
     sim = simulated(executed)
     where = "the simulated directory" if sim else "our systems"
     comment = "\n".join([UPDATE_START + ". Here's what we did:", "", *simulation_notice(executed),
-                         *[f"- {m}" for m in caller_messages], "",
+                         *action_lines(caller_messages, executed), "",
                          f"We checked the change in {where} and it's in place, so we've resolved this ticket. "
                          + REOPEN_INVITE])
     note = "\n".join([AGENT_HEADER, "Action: completed the actions below and verified each one by reading "
@@ -428,7 +435,7 @@ class TicketAgent:
             return self._security_handoff(incident, state)
         team = DEFAULT_TEAM
         comment = "\n".join([AI_COMMENT_START + ". Here's what we did:", "", *simulation_notice(kit.ctx.executed),
-                             *[f"- {m}" for m in kit.ctx.caller_messages], "",
+                             *action_lines(kit.ctx.caller_messages, kit.ctx.executed), "",
                              "Please reply to let us know: is it working now? If yes, we'll close the ticket. "
                              "If not, tell us what's still happening and a technician will take over."])
         note = "\n".join([AGENT_HEADER, "Action: completed the actions below"
@@ -451,7 +458,7 @@ class TicketAgent:
         what ran, hand it to Security (In Progress, priority 2). Never On Hold, never closed by the AI."""
         kit = self.toolkit
         comment = "\n".join([AI_COMMENT_START + ". Here's what we did so far:", "", *simulation_notice(kit.ctx.executed),
-                             *[f"- {m}" for m in kit.ctx.caller_messages], "",
+                             *action_lines(kit.ctx.caller_messages, kit.ctx.executed), "",
                              "Because this may be a security issue, our Security team will review your ticket and "
                              "follow up with you."])
         note = "\n".join([AGENT_HEADER, "Action: possible security incident (code check on the incident text); "

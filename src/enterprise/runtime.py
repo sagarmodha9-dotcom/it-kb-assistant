@@ -11,7 +11,8 @@ a technician.
 import copy
 import re
 
-from agent import (AI_COMMENT_START, AGENT_HEADER, CONFIRM_MARKER, DEFAULT_TEAM, _is_resolved, executed_lines,
+from agent import (AI_COMMENT_START, AGENT_HEADER, CONFIRM_MARKER, DEFAULT_TEAM, _is_resolved, action_lines,
+                   executed_lines,
                    looks_like_security, simulated, simulation_notice, verified_fix, verified_resolution,
                    with_service_desk)
 from .framework import AuditLog, Context, MemoryStore, Toolkit, ToolError
@@ -99,7 +100,7 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
         return {"outcome": "executed_resolved", "results": results}
     if done and not failed:
         comment = "\n".join([AI_COMMENT_START + ". Your request was approved and completed:", "",
-                             *simulation_notice(kit.ctx.executed), *[f"- {m}" for m in kit.ctx.caller_messages], "",
+                             *simulation_notice(kit.ctx.executed), *action_lines(kit.ctx.caller_messages, kit.ctx.executed), "",
                              "Please reply to let us know: is it working now? If yes, we'll close the ticket."])
         note = "\n".join([AGENT_HEADER, f"Approved by {approver}; the approved action(s) ran"
                           + (" [SIMULATED backends: no real change]" if simulated(kit.ctx.executed) else "") + ".",

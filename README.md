@@ -318,6 +318,10 @@ flowchart LR
   function with `{"minutes": 0}` three times to watch reminder 1, reminder 2, and the no-response close.
 
 **Outstanding**
+- With a real tenant, "the system confirmed the change" should become "the system confirmed the problem
+  is gone": workflow-specific evidence before an instant close, for example a successful sign-in in the
+  Entra sign-in logs after an unlock, or the license showing in the user's M365 apps. Until then a
+  verified directory state is treated as evidence only on real systems (simulated ones wait for the caller).
 - Real integrations for workflows 1-4, 6, 10, 11 need a test Microsoft Entra ID / M365 tenant with an
   app registration scoped to test users (Graph permissions such as `User-PasswordProfile.ReadWrite.All`,
   `GroupMember.ReadWrite.All`, `DeviceManagementManagedDevices.PrivilegedOperations.All`).
