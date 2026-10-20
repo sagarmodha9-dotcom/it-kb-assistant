@@ -59,6 +59,9 @@ class Tool:
     idempotent: bool = True              # safe to repeat if a call timed out
     precheck: Callable | None = None     # precheck(ctx, args) -> reason to deny, or ""
     once_per_ticket: bool = False        # at most one execution per ticket, whatever the arguments
+    verifies_fix: bool = False           # the handler reads the system back after the change and only reports
+                                         # success if the end state is confirmed, so success means "fixed":
+                                         # the ticket can be resolved without waiting for the caller
 
     def schema(self) -> dict:
         return {"name": self.name, "description": self.description,
@@ -308,7 +311,7 @@ class Executor:
         if tool.risk != READ:
             ctx.store.put(key, {**result, "messages": ctx.caller_messages[before:]})
             ctx.executed.append({"tool": tool.name, "workflow": tool.workflow, "simulated": tool.simulated,
-                                 "args": redact(args)})
+                                 "verifies_fix": tool.verifies_fix, "args": redact(args)})
         ctx.audit.record(ticket=ctx.ticket, action="executed", tool=tool.name, args=args, attempts=attempt,
                          simulated=tool.simulated, result=result)
         return result

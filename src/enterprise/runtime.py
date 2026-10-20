@@ -4,12 +4,15 @@ approved actions.
 Approval decisions come from ServiceNow: an approver sets the incident's Approval field to Approved
 or Rejected, a Business Rule sends a signed "approval" event, and handle_approval_decision checks
 that this person may approve (right role, not the requester), then runs exactly the approved action
-(no model involved) and asks the caller to confirm, or tells them it was rejected.
+(no model involved). If the action verified its result in the system (license, group access) the
+incident is resolved right away; otherwise the caller is asked to confirm. A rejection goes back to
+a technician.
 """
 import copy
 import re
 
-from agent import AI_COMMENT_START, AGENT_HEADER, CONFIRM_MARKER, DEFAULT_TEAM
+from agent import (AI_COMMENT_START, AGENT_HEADER, CONFIRM_MARKER, DEFAULT_TEAM, executed_lines, simulated,
+                   simulation_notice, verified_fix, verified_resolution)
 from .framework import AuditLog, Context, MemoryStore, Toolkit, ToolError
 from .sim import SimBackends
 from .workflows import build_registry
@@ -48,7 +51,8 @@ def demo_llm(llm):
     return clone
 
 
-def handle_approval_decision(desk, incident: dict, approver: str, approved: bool, store, backends=None) -> dict:
+def handle_approval_decision(desk, incident: dict, approver: str, approved: bool, store, backends=None,
+                             resolve_simulated: bool = False) -> dict:
     """Run (or cancel) every pending approval on this incident after an approver's decision."""
     ticket = str(incident.get("number") or "")
     pending = (store.get(f"pending#{ticket}") or {"ids": []})["ids"]
@@ -81,12 +85,20 @@ def handle_approval_decision(desk, incident: dict, approver: str, approved: bool
     failed = [r for r in results if r.get("tool") and not r.get("ok") and not r.get("rejected")]
     rejected = [r for r in results if r.get("rejected")]
     audit = "\n".join(f"- {e['action']}: {e.get('tool', '')}" for e in kit.ctx.audit.entries)
+    if done and not failed and verified_fix(kit.ctx.executed, incident, resolve_simulated):
+        # The approved action read its end state back from the system: resolve now, the caller can reopen.
+        steps = [f"- approved by {approver}"] + [f"- {e['action']}: {e.get('tool', '')}" for e in kit.ctx.audit.entries]
+        comment, note, close_notes = verified_resolution(kit.ctx.caller_messages, kit.ctx.executed, steps)
+        desk.resolve(incident, comment=comment, work_note=note, close_notes=close_notes, team=DEFAULT_TEAM)
+        return {"outcome": "executed_resolved", "results": results}
     if done and not failed:
         comment = "\n".join([AI_COMMENT_START + ". Your request was approved and completed:", "",
-                             *[f"- {m}" for m in kit.ctx.caller_messages], "",
+                             *simulation_notice(kit.ctx.executed), *[f"- {m}" for m in kit.ctx.caller_messages], "",
                              "Please reply to let us know: is it working now? If yes, we'll close the ticket."])
-        note = "\n".join([AGENT_HEADER, f"Approved by {approver}; the approved action(s) ran and were verified "
-                          "[SIMULATED backends].", CONFIRM_MARKER + ".", "", "Audit:", audit])
+        note = "\n".join([AGENT_HEADER, f"Approved by {approver}; the approved action(s) ran"
+                          + (" [SIMULATED backends: no real change]" if simulated(kit.ctx.executed) else "") + ".",
+                          CONFIRM_MARKER + ".", "", "Actions executed:", *executed_lines(kit.ctx.executed), "",
+                          "Audit:", audit])
         desk.send_fix(incident, comment=comment, work_note=note, team=DEFAULT_TEAM)
         return {"outcome": "executed_awaiting_caller", "results": results}
     if rejected:

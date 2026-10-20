@@ -82,6 +82,17 @@ Parameters:
     AllowedValues: ["true", "false"]
     Default: "true"
     Description: "Give the ticket agent the 12 enterprise IT workflow tools (simulated Entra ID, Intune, M365, HR backends; real ServiceNow and KB)."
+  ServiceNowFollowUpHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: "Hours between follow-ups when a caller doesn't answer: reminder after 1x, reminder after 2x, resolved after 3x (the 3-strike rule)."
+  ServiceNowResolveSimulated:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: "Test switch. false (default): a fix verified only in the SIMULATED directory waits for the caller (simulated evidence never closes a real ticket). true: resolve it right away, labeled SIMULATED (dev instances only)."
   ServiceNowPasswordParam:
     Type: String
     Description: SSM SecureString holding the service account's password.
@@ -582,6 +593,7 @@ Resources:
           SN_ENTERPRISE: !Ref ServiceNowEnterprise
           ENTERPRISE_TABLE: !Ref EnterpriseStateTable   # approvals, idempotency keys, lifecycle checkpoints
           SN_CLOSE_CODE: Solution provided
+          SN_RESOLVE_SIMULATED: !Ref ServiceNowResolveSimulated
       Policies:
         - !Ref AssistantRuntimePolicy
         - Statement:
@@ -603,6 +615,41 @@ Resources:
               - ReportBatchItemFailures
             ScalingConfig:
               MaximumConcurrency: 2   # protects model quotas during a burst of new incidents
+
+  # The 3-strike rule: hourly, finds tickets waiting on a caller who hasn't answered, sends reminder 1,
+  # then reminder 2, then resolves (caller can reply to reopen). ServiceNow is the source of truth.
+  ServiceNowFollowUpFunction:
+    Type: AWS::Serverless::Function
+    Condition: UseServiceNow
+    Properties:
+      Handler: app.servicenow_followups
+      Description: Remind callers who haven't confirmed a fix; resolve after two reminders
+      Timeout: 120
+      Environment:
+        Variables:
+          SN_INSTANCE_URL: !Ref ServiceNowInstanceUrl
+          SN_USER: !Ref ServiceNowUser
+          SN_PASSWORD_PARAM: !Ref ServiceNowPasswordParam
+          SN_MODE: !Ref ServiceNowMode
+          SN_FOLLOWUP_HOURS: !Ref ServiceNowFollowUpHours
+          ENTERPRISE_TABLE: !Ref EnterpriseStateTable   # per-step claims, so overlapping runs never double-send
+          SN_NO_RESPONSE_CLOSE_CODE: No resolution provided   # a timeout is never recorded as a fix
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ServiceNowPasswordParam}
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource: !GetAtt EnterpriseStateTable.Arn
+      Events:
+        Hourly:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Caller follow-ups (3-strike rule)
 
   ServiceNowAlarmTopic:
     Type: AWS::SNS::Topic
@@ -724,6 +771,9 @@ Outputs:
   ServiceNowDeadLetterQueueUrl:
     Condition: UseServiceNow
     Value: !Ref ServiceNowDeadLetterQueue
+  ServiceNowFollowUpFunctionName:
+    Condition: UseServiceNow
+    Value: !Ref ServiceNowFollowUpFunction
   DemoApiUrl:
     Condition: UsePublicDemo
     Value: !Sub https://${AssistantApi}.execute-api.${AWS::Region}.amazonaws.com/demo/ask

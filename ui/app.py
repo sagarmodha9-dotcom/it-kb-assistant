@@ -299,15 +299,20 @@ AGENT_STEP_NAMES = {"search_knowledge_base": "Searched the knowledge base",
                     "send_fix_to_caller": "Sent the fix to the caller",
                     "escalate_incident": "Escalated",
                     "verify_caller_identity": "Verified identity (MFA push)",
-                    "complete_and_confirm": "Sent results, asked the caller to confirm",
+                    "complete_and_confirm": "Sent the results to the caller",
                     "request_approval": "Requested approval",
                     "link_to_outage": "Linked to the outage incident"}
 
 
 def agent_html(plan: dict) -> str:
     """What the ticket agent would do with this as a new ServiceNow incident (dry run in the demo)."""
-    if plan.get("action") == "awaiting_caller":
-        badge, decision = "ok", "Would send this to the caller and resolve only after they confirm it worked"
+    if plan.get("action") == "resolved":
+        badge, decision = "ok", ("Would resolve the ticket: the fix was verified by reading the system back "
+                                 "(here a simulated directory; on a real ServiceNow ticket that needs a real tenant). "
+                                 "The caller can reply to reopen")
+    elif plan.get("action") == "awaiting_caller":
+        badge, decision = "ok", ("Would send this to the caller and wait: resolved if they confirm, "
+                                 "otherwise two daily reminders, then closed for no response")
     elif plan.get("action") == "awaiting_approval":
         badge, decision = "warn", "Would wait for an approver, then run the approved action automatically"
     else:
@@ -323,8 +328,10 @@ def agent_html(plan: dict) -> str:
             f'<span class="kb-agent-decision">{decision}</span></div><ol>{steps}</ol>'
             '<div class="kb-agent-foot">Demo caller: Alex Rivera, an employee of a fictional company. Steps marked '
             "simulated run against simulated Entra ID, Intune, and Microsoft 365 backends; nothing real is changed "
-            "and nothing is written. In the ServiceNow integration this runs on every new incident, and a ticket "
-            "is resolved only after the caller confirms.</div></div>")
+            "and nothing is written. In the ServiceNow integration this runs on every new incident. A ticket is "
+            "resolved right away only when a real system confirms the fix; otherwise the caller confirms, or it "
+            "closes for no response after two reminders. Urgent, security and outage tickets always go to people."
+            "</div></div>")
 
 
 def show_turn(i: int, turn: dict) -> None:

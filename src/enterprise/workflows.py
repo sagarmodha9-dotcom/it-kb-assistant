@@ -10,6 +10,11 @@ Simulated backends (enterprise/sim.py) until authorized test tenants are connect
 Each write handler verifies its own result by reading the backend back before reporting success,
 and gives the caller a fixed, code-written message (the model never writes what the caller is told
 about an action).
+
+verifies_fix=True marks the actions whose success IS the fix (unlock, password reset, license,
+group access): the end state was read back from the system, so the agent resolves the ticket right
+away. Everything else (sync, software install, onboarding/offboarding, any KB advice) needs the
+caller to confirm, or times out after two reminders (followup.py).
 """
 from .framework import LOW, READ, SENSITIVE, Registry, Tool, ToolError
 from .loganalysis import analyze
@@ -70,7 +75,7 @@ def build_registry() -> Registry:
         ctx.caller_messages.append("Your account has been unlocked. Please sign in again with your current password.")
         return {"summary": "account unlocked and verified"}
     r.register(Tool("unlock_account", 1, "Unlock the caller's own account (identity must be verified).", unlock, USER,
-                    risk=SENSITIVE, requires_identity=True, precheck=_self_only, idempotent=True))
+                    risk=SENSITIVE, requires_identity=True, precheck=_self_only, idempotent=True, verifies_fix=True))
 
     def reset(ctx, args):
         user = args.get("user") or ctx.caller
@@ -85,7 +90,7 @@ def build_registry() -> Registry:
     r.register(Tool("reset_password", 1, "Reset the caller's own password: a unique random temporary password is "
                     "sent to their registered phone (never shown here) and must be changed at next sign-in.",
                     reset, USER, risk=SENSITIVE, requires_identity=True, precheck=_self_only, idempotent=False,
-                    once_per_ticket=True))
+                    once_per_ticket=True, verifies_fix=True))
 
     # ---------------------------------------------------------------- 2. Intune device diagnostics
     def devices(ctx, args):
@@ -128,12 +133,15 @@ def build_registry() -> Registry:
             raise ToolError(f"no {info['name']} seats left: a license admin must buy more")
         info["used"] += 1
         b(ctx).user(user)["licenses"].append(sku)
+        if sku not in b(ctx).user(user)["licenses"]:   # read back: only report what the directory confirms
+            raise ToolError("license assignment did not take effect")
         ctx.caller_messages.append(f"{info['name']} has been assigned to you. It can take up to an hour to "
                                    "appear; sign out and back in to Office apps after that.")
         return {"summary": f"{sku} assigned and verified"}
     r.register(Tool("assign_license", 3, "Assign a Microsoft 365 license to the caller (manager approval).",
                     assign_license, {**USER, "sku": {"type": "string"}}, ("sku",), risk=SENSITIVE,
-                    requires_identity=True, approval="manager", precheck=_self_only, idempotent=True))
+                    requires_identity=True, approval="manager", precheck=_self_only, idempotent=True,
+                    verifies_fix=True))
 
     # ---------------------------------------------------------------- 4. groups and access
     def find_group(ctx, args):
@@ -153,12 +161,14 @@ def build_registry() -> Registry:
             raise ToolError("unknown group")
         if ctx.caller not in group["members"]:
             group["members"].append(ctx.caller)
+        if ctx.caller not in b(ctx).data["groups"][args["group"]]["members"]:   # read back the membership
+            raise ToolError("group membership did not take effect")
         ctx.caller_messages.append(f"You've been added to {args['group']} ({group['resource']}). Access can "
                                    "take up to 30 minutes; sign out and back in if you still don't see it.")
         return {"summary": f"added to {args['group']} and verified"}
     r.register(Tool("add_group_member", 4, "Add the caller to an access group (group owner approval).", add_member,
                     {"group": {"type": "string"}, **USER}, ("group",), risk=SENSITIVE, requires_identity=True,
-                    approval="group_owner", precheck=_self_only, idempotent=True))
+                    approval="group_owner", precheck=_self_only, idempotent=True, verifies_fix=True))
 
     # ---------------------------------------------------------------- 5 / 8 / 10. service health (monitoring)
     def health(ctx, args):

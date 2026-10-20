@@ -62,9 +62,10 @@ protects the Anthropic API fallback too.
 ## ServiceNow integration
 
 When an incident is created in **ServiceNow**, an AI **ticket agent** works it (`ServiceNowMode=agent`,
-the default; details in [Ticket agent](#ticket-agent)): it sends the caller a verified fix from the
-knowledge base and **resolves only after the caller confirms it worked**, or escalates to the right
-team with a handoff note. `ServiceNowMode=suggest` is the original, more conservative mode: the AI only
+the default; details in [Ticket agent](#ticket-agent)): it fixes what it can, sends the caller a
+verified fix from the knowledge base, or escalates to the right team with a handoff note. It **closes a
+ticket on its own only with evidence**: a real system confirmed the fix, or the caller said it worked,
+or the caller didn't answer two reminders (recorded as "no response", never as fixed). `ServiceNowMode=suggest` is the original, more conservative mode: the AI only
 adds an internal **work note** with a suggested resolution and the KB articles it came from, and never
 changes state, priority, or assignment. The recording below and the results further down are from
 suggest mode.
@@ -126,20 +127,45 @@ flowchart TD
     F --> D{Claude decides}
     D -->|verified KB answer, not urgent,<br/>no outage, not security| FIX[Send the fix to the caller<br/>On Hold - Awaiting Caller]
     D -->|otherwise| ESC[Escalate: team, priority,<br/>handoff note]
-    FIX --> C{Caller replies}
+    FIX --> C{Caller replies?}
     C -->|it worked| RES[Resolved]
     C -->|still broken / unclear| BACK[In Progress, Service Desk<br/>with the caller's reply]
+    C -->|no reply: day 1, day 2| REM[Reminder 1, reminder 2]
+    REM -->|still no reply: day 3| NR[Resolved - no response<br/>close code: No resolution provided]
+    RES & NR -.->|caller replies 'still broken'| BACK
 ```
+
+#### When a ticket closes without the caller
+
+The rule in one line: **if the system can prove it's fixed, close it; if only the person can tell, wait
+for them** (and stop waiting after two reminders). "Action verified" and "issue resolved" are kept apart:
+
+| Situation | What the agent does | Evidence recorded |
+|---|---|---|
+| Fix the system can check (unlock, password reset, license, group access) on a **real** tenant | Runs it, reads the end state back, **resolves right away**, tells the caller they can reply to reopen | Close code `Solution provided`, close notes "Resolved by the AI agent: verified fix (...)" |
+| The same fix on the **simulated** directory | Waits for the caller like any other fix: simulated evidence never closes a real ticket. `ServiceNowResolveSimulated=true` opts a dev instance in, labeled SIMULATED everywhere | Caller is told up front it's a test environment and nothing real changed |
+| Something only the caller can judge (KB how-to, VPN steps, software install, device sync) | On Hold - Awaiting Caller. Reminder after 1 day, last reminder after 2, resolved on day 3 (`src/followup.py`, hourly) | Close code `No resolution provided`, close notes "no response after 2 reminders, not confirmed fixed" |
+| Caller replies "it worked" | Resolved | Close notes quote the caller |
+| Caller replies anything else, even after the AI resolved it | Reopened (In Progress) for the Service Desk with the reply | Work note quotes the reply |
+| Urgent (priority 1-2), security, outage-linked, or moved to another team | Never closed by the AI: escalated, or handed to a technician at strike 3 | - |
+
+The AI only ever sets **Resolved**; ServiceNow's normal auto-close turns that into Closed later, which
+is the window in which the caller can reply to reopen. The follow-up job keeps no schedule of its own:
+it reads ServiceNow (On Hold - Awaiting Caller, unassigned, last touched by the AI's account) and counts
+its own "Follow-up reminder N of 2" work notes, so any human touch takes the ticket out of its hands, and
+each step is claimed in DynamoDB so two overlapping runs can't send the same reminder twice.
+`ServiceNowFollowUpHours` (default 24) sets the interval; a manual run can treat everything idle as due:
+`aws lambda invoke --function-name <ServiceNowFollowUpFunctionName> --payload '{"minutes": 0}' out.json`.
 
 | Rule | Enforced how |
 |---|---|
 | Only a verified fix goes to the caller | `send_fix_to_caller` takes a `search_id`, not text: the caller gets the knowledge base answer that passed the grounding check, never words the model wrote itself |
-| Resolved means the caller confirmed it | The agent never sets Resolved on its own. A second Business Rule sends the caller's reply; Claude classifies it, and only a clear "it worked" resolves the incident |
+| Resolved only with evidence | A real system confirmed the fix, the caller said it worked (a second Business Rule sends the reply; Claude classifies it), or two reminders went unanswered (closed as no response). See the table above |
 | Urgent and outage incidents go to people | No self-service for priority 1-2, or when 3+ similar incidents arrived in the last hour (likely outage: escalated to the team with priority 2 and the related incident numbers) |
 | Security goes to Security | Clicked links, entered passwords, malware: escalated to Security with priority 2 even when a KB article exists |
 | Priority only goes up, at most to 2 | A person decides what is 1 - Critical |
 | Fixed list of teams | Service Desk, Network, Hardware, Software, Identity & Access, Security; anything else goes to the Service Desk |
-| No disruptive tools | The agent can't reset passwords, change permissions, or touch devices: its only write actions are send fix, escalate, and resolve-after-confirmation |
+| No direct disruptive tools | On its own the agent can only send a fix, escalate, and resolve. Account, access, and device actions exist only in enterprise mode (below), behind identity checks, approvals, and the audit framework |
 | Blocked input never reaches the agent | Prompt injection, requests to bypass security, ID numbers: straight to the Service Desk for manual review |
 | Bounded | At most 5 model calls and 3 searches; if it doesn't decide, it escalates. Model down: SQS retries, and on the last try it escalates instead of guessing |
 | Stays out of a person's way | It only works new, unassigned incidents, and ignores a caller reply once a technician owns the ticket |
@@ -187,8 +213,9 @@ from the golden set (`scripts/servicenow_eval.py`), each scored on the AI work n
 ## Enterprise IT agent (12 workflows)
 
 With `ServiceNowEnterprise=true` (the default) the ticket agent also gets IT tools for 12 common
-service-desk workflows. It diagnoses, takes approved actions, and verifies them, and it asks the caller
-to confirm before anything is resolved. Everything runs through one framework (`src/enterprise/`),
+service-desk workflows. It diagnoses, takes approved actions, and verifies them by reading the system
+back; it resolves on its own only when a real system confirmed the fix (otherwise the caller confirms,
+or it closes for no response after two reminders). Everything runs through one framework (`src/enterprise/`),
 so every workflow gets the same authorization, approval, audit, and failure handling.
 
 **Real vs simulated.** ServiceNow, the knowledge base (RAG + Bedrock Guardrails), and Claude are real.
@@ -211,17 +238,18 @@ Nothing in this project changes a real account, device, or license.
 | 9 | Log analysis and root cause | Analysis **real**, logs simulated | Groups recurring events, correlates chains (failed sign-ins -> lockout, disk errors -> corruption), root cause | Own devices only | 1 |
 | 10 | Outlook and Microsoft 365 diagnostics | Simulated Exchange Online | Quota, archive, OST size, external forwarding (flagged for Security), message trace | Own mailbox only | 1 |
 | 11 | Onboarding and offboarding | Simulated Entra ID / M365 / HR | Role-template checklist (account, groups, licenses, software, device), offboarding (disable, revoke, remove, free seats); resumes after a failed step | Manager requests, HR approval, identity | 2 |
-| 12 | Follow-up and resolution verification | **Real** ServiceNow | Caller confirms -> Resolved; anything else -> technician; approvals run the approved action and ask again | Caller only, once | 2 (+ agent tests) |
+| 12 | Follow-up and resolution verification | **Real** ServiceNow | Verified fix (real system) -> Resolved; caller confirms -> Resolved; silence -> reminders on day 1 and 2, resolved as no response on day 3; any other reply, even after resolving -> reopened for a technician | Caller only; never urgent, security, or outage tickets | 20 (+ agent tests) |
 
 Two independent code reviews (agent, then a security review of the enterprise framework) found
 issues that were fixed and now have regression tests, for example repeated resets via reworded
 arguments, a timed-out write retried by the model, approver taken from later edits, and HR records
 readable by anyone.
 
-Tests: `tests/test_enterprise.py` (48) and `tests/test_agent.py` (26), 169 in the suite. They cover
+Tests: `tests/test_enterprise.py` (51), `tests/test_followup.py` (16) and `tests/test_agent.py` (26), 188 in
+the suite. They cover
 success, permission denials, identity and approval gates, retries after throttling, timeouts (reads
 retried; writes never blindly repeated), duplicate requests (SQS redelivery), resumable lifecycle
-runs, escalation, and demo isolation. Not yet run live against ServiceNow: see "Outstanding" below.
+runs, escalation, the close-without-the-caller policy, and demo isolation.
 
 ```mermaid
 flowchart LR
@@ -272,14 +300,16 @@ flowchart LR
   request, and `DryRunDesk`: it can't reach ServiceNow or any real tool.
 
 **Try it**
-- Public demo: ask "I'm locked out of my account" (verify identity -> unlock -> confirm), "I need access
+- Public demo: ask "I'm locked out of my account" (verify identity -> unlock -> would resolve), "I need access
   to the Finance Reports SharePoint site" (approval from the group owner), "My laptop is really slow and
   Outlook keeps crashing" (device, logs, mailbox diagnostics), or "VPN keeps disconnecting".
 - ServiceNow (after `servicenow_setup.py` creates the fictional employees): create an incident with
-  caller **Alex Rivera**, "I'm locked out of my account" -> the agent verifies, unlocks (simulated), and
-  asks Alex to confirm. Caller **Taylor Kim**, "I need access to the Finance Reports site" -> Approval =
-  Requested; log in as **Sam Ortiz** (the group owner) and set Approval to Approved -> the agent adds the
-  member and asks Taylor to confirm. Setting it as anyone else is refused and logged.
+  caller **Alex Rivera**, "I'm locked out of my account" -> the agent verifies, unlocks (simulated), tells
+  Alex up front it's a test environment, and waits for him (or, with `ServiceNowResolveSimulated=true`,
+  resolves it). Caller **Taylor Kim**, "I need access to the Finance Reports site" -> Approval = Requested;
+  log in as **Sam Ortiz** (the group owner) and set Approval to Approved -> the agent adds the member.
+  Setting it as anyone else is refused and logged. Leave a fixed ticket unanswered and run the follow-up
+  function with `{"minutes": 0}` three times to watch reminder 1, reminder 2, and the no-response close.
 
 **Outstanding**
 - Real integrations for workflows 1-4, 6, 10, 11 need a test Microsoft Entra ID / M365 tenant with an
@@ -287,7 +317,12 @@ flowchart LR
   `GroupMember.ReadWrite.All`, `DeviceManagementManagedDevices.PrivilegedOperations.All`).
 - Simulated backend state lives in memory per Lambda invocation (approved actions run against fresh
   simulated data). Approvals, idempotency keys, and lifecycle checkpoints are persisted in DynamoDB.
-- Not yet measured live in ServiceNow: the 12-workflow scenarios have unit and integration tests only.
+- Live in ServiceNow so far (Oct 19 2026): the lockout scenario ran end to end (INC0010050: KB search,
+  similar-incident check, simulated MFA and unlock, caller asked to confirm, On Hold - Awaiting Caller, in
+  about 30 seconds). Found live: for "I need access to the Finance Reports site" the agent sent the KB
+  article on how to request access instead of running the access workflow. The agent's instructions now
+  say requests to *do* something go through the tools; the KB is for how-to and troubleshooting.
+  The other workflows have unit and integration tests only.
 - Recommended in ServiceNow: an ACL so only approver roles can write an incident's Approval field, and
   requiring opened_by = caller before sensitive actions.
 

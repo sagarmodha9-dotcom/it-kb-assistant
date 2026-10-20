@@ -11,8 +11,13 @@ For each new, unassigned incident the agent:
        note saying what it tried and why it is escalating.
   4. When the caller replies (a second Business Rule sends that event), handle_caller_reply reads
      the reply: if the caller confirms it worked, the incident is Resolved; otherwise (still broken,
-     or unclear) it goes to a technician with the full history. A ticket is only resolved after the
-     caller confirms the fix worked.
+     or unclear) it goes to a technician with the full history.
+  5. Closing without a reply (the "mix" policy):
+     - a fix the system can verify (unlock, password reset, license, group access: the tool read the
+       end state back after the change) is resolved right away; the caller can reply to reopen it;
+     - anything only the caller can judge (KB advice, installs, device syncs) waits for the caller.
+       If they don't answer, followup.py sends two daily reminders and resolves it on day 3.
+     A reply on a ticket the AI resolved reopens it for a technician unless it says it's fixed.
 
 Claude decides which tools to call and what to do (tool use). The rules that matter are enforced
 in code, whatever the model asks for:
@@ -44,6 +49,24 @@ OUTAGE_THRESHOLD = 3              # this incident + 2 similar ones in the window
 OUTAGE_WINDOW_MINUTES = 60
 FIX_MARKER = "Action: sent a knowledge base fix to the caller"
 CONFIRM_MARKER = "Waiting for the caller to confirm"   # in every note that hands the caller something to confirm
+RESOLVED_MARKER = "Resolved by the AI agent"            # starts close notes (and a note line) when the AI resolves
+REOPEN_INVITE = "If anything's still not working, just reply here and the ticket reopens for a technician."
+SIMULATED_NOTICE = ("Test environment: these actions ran against a simulated company directory "
+                    "(not a real Entra ID, Intune or Microsoft 365 tenant). No real account, device or license was changed.")
+
+
+def simulated(executed: list[dict]) -> bool:
+    return any(e.get("simulated") for e in executed)
+
+
+def simulation_notice(executed: list[dict]) -> list[str]:
+    """Lines the caller sees first whenever a simulated backend ran, so a test never reads as a real change."""
+    return [SIMULATED_NOTICE, ""] if simulated(executed) else []
+
+
+def executed_lines(executed: list[dict]) -> list[str]:
+    return [f"- {e['tool']} (workflow {e['workflow']}, {'SIMULATED' if e.get('simulated') else 'live'})"
+            for e in executed]
 AI_COMMENT_START = "Hi, this is the IT help desk's AI assistant"
 MAX_STEPS = 5
 ENTERPRISE_MAX_STEPS = 10
@@ -107,8 +130,8 @@ def priority_number(value) -> int:
 def safe_text(text: str) -> str:
     """Model- or caller-influenced text going into a work note can't contain the markers the agent
     relies on (so it can't make an escalation look like a fix waiting for confirmation)."""
-    return re.sub(r"Waiting for the caller to confirm|\[AI Agent - IT KB Assistant\]|Caller reply at",
-                  "[removed]", str(text or ""), flags=re.I)
+    return re.sub(r"Waiting for the caller to confirm|\[AI Agent - IT KB Assistant\]|Caller reply at|"
+                  r"Resolved by the AI agent|Follow-up reminder", "[removed]", str(text or ""), flags=re.I)
 
 
 def plain(text: str) -> str:
@@ -134,11 +157,16 @@ class AgentUnavailable(Exception):
 ENTERPRISE_PROMPT = """
 
 You can also act through IT tools (each call is authorized and audited by the platform, not by you):
+- Requests to DO something (access to a site, group or app; a license; software; an unlock or password
+  reset; onboarding/offboarding) go through these tools, even if the knowledge base explains how to ask for
+  it: find what's needed, verify identity, and act or request approval. send_fix_to_caller is for how-to and
+  troubleshooting answers the caller can follow themselves.
 - Diagnose first (account status, devices, licenses, groups, service health, logs, mailbox) before acting.
 - Account, access, license, software, and lifecycle changes require verify_caller_identity first, and some
   need an approver: if a tool says approval was requested, finish with request_approval.
-- After an action succeeds, finish with complete_and_confirm: the caller gets a fixed, verified message and
-  is asked to confirm it worked. Never claim an action happened unless the tool returned ok.
+- After an action succeeds, finish with complete_and_confirm: the caller gets a fixed, verified message. If
+  every action verified its result in the system the ticket is resolved; otherwise the caller is asked to
+  confirm it worked. Never claim an action happened unless the tool returned ok.
 - If a tool is denied, fails, or reports an unknown outcome, don't retry it: escalate with the reason.
 - If find_similar_incidents reports a possible outage, check get_service_health, link the incident to the
   oldest related one with link_to_outage, then escalate with priority "2".
@@ -150,8 +178,9 @@ ENTERPRISE_TOOLS = [
                     "approval requested. Only after a tool reported approval_requested.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "complete_and_confirm",
-     "description": "Finish: send the caller the verified results of the actions that ran, and ask them to "
-                    "confirm it's fixed. The incident is resolved only after they confirm.",
+     "description": "Finish: send the caller the verified results of the actions that ran. Resolves the "
+                    "incident if every action verified its result in the system; otherwise asks the caller "
+                    "to confirm it's fixed.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "link_to_outage",
      "description": "Link this incident to the oldest related incident in a likely outage (parent incident).",
@@ -160,15 +189,52 @@ ENTERPRISE_TOOLS = [
 ]
 
 
+def verified_fix(executed: list[dict], incident: dict, allow_simulated: bool = False) -> bool:
+    """Resolve without waiting for the caller only when something actually ran, every action that ran
+    read its end state back from the system (Tool.verifies_fix), and the incident isn't urgent
+    (priority 1-2 always stays with people).
+
+    "Action verified" is only evidence of "issue resolved" when the system is real: a simulated backend
+    confirming its own change proves nothing about the caller's problem, so simulated actions wait for
+    the caller (and the 3-strike rule) unless a test setup explicitly opts in (allow_simulated, labeled
+    SIMULATED everywhere). The public demo opts in because it writes nothing."""
+    return bool(executed) and all(e.get("verifies_fix") for e in executed) \
+        and priority_number(incident.get("priority")) >= 3 and (allow_simulated or not simulated(executed))
+
+
+def verified_resolution(caller_messages: list[str], executed: list[dict], step_lines: list[str]) -> tuple:
+    """(comment, work note, close notes) for a fix the system verified. Code-written, never model text."""
+    tools = ", ".join(e["tool"] for e in executed)
+    sim = simulated(executed)
+    where = "the simulated directory" if sim else "our systems"
+    comment = "\n".join([AI_COMMENT_START + ". Here's what we did:", "", *simulation_notice(executed),
+                         *[f"- {m}" for m in caller_messages], "",
+                         f"We checked the change in {where} and it's in place, so we've resolved this ticket. "
+                         + REOPEN_INVITE])
+    note = "\n".join([AGENT_HEADER, "Action: completed the actions below and verified each one by reading "
+                      + ("the SIMULATED backend" if sim else "the target system") + " back after the change; "
+                      "resolved without waiting for the caller.", RESOLVED_MARKER + " (verified fix).", "",
+                      "Actions executed:", *executed_lines(executed), "",
+                      "Steps:", *step_lines, "",
+                      "Why no caller confirmation: each action read the system back after the change and confirmed "
+                      "the end state.", "If the caller replies that it still isn't working, the incident reopens "
+                      "for the Service Desk."])
+    close_notes = (f"{RESOLVED_MARKER}: verified fix ({tools})" + (" [SIMULATED backends: no real change]" if sim else "")
+                   + ". The end state was confirmed by reading the system back after each change. The caller was "
+                   "told they can reply to reopen.")
+    return comment, note, close_notes
+
+
 class TicketAgent:
     def __init__(self, llm, assistant, desk, max_steps: int | None = None,
-                 min_step_seconds: float = MIN_SECONDS_PER_STEP, toolkit=None):
+                 min_step_seconds: float = MIN_SECONDS_PER_STEP, toolkit=None, resolve_simulated: bool = False):
         self.llm = llm
         self.assistant = assistant
         self.desk = desk
         self.max_steps = max_steps or (ENTERPRISE_MAX_STEPS if toolkit else MAX_STEPS)
         self.min_step_seconds = min_step_seconds
         self.toolkit = toolkit   # enterprise.framework.Toolkit: the 12 workflows, authorized and audited
+        self.resolve_simulated = resolve_simulated   # see verified_fix
         self.system = SYSTEM_PROMPT + (ENTERPRISE_PROMPT if toolkit else "")
         self.tools = TOOLS + (ENTERPRISE_TOOLS + toolkit.schemas() if toolkit else [])
 
@@ -310,21 +376,34 @@ class TicketAgent:
 
     def _report_actions(self, incident, state) -> dict:
         kit = self.toolkit
-        comment = "\n".join([AI_COMMENT_START + ". Here's what we did:", "",
+        if verified_fix(kit.ctx.executed, incident, self.resolve_simulated) and not self._similar(incident, "", state)["possible_outage"]:
+            return self._resolve_verified(incident, state)
+        comment = "\n".join([AI_COMMENT_START + ". Here's what we did:", "", *simulation_notice(kit.ctx.executed),
                              *[f"- {m}" for m in kit.ctx.caller_messages], "",
                              "Please reply to let us know: is it working now? If yes, we'll close the ticket. "
                              "If not, tell us what's still happening and a technician will take over."])
-        executed = [f"- {e['tool']} (workflow {e['workflow']}, {'SIMULATED' if e['simulated'] else 'live'})"
-                    for e in kit.ctx.executed]
-        note = "\n".join([AGENT_HEADER, "Action: completed and verified the actions below; sent the results to the "
-                          "caller; On Hold - Awaiting Caller.", CONFIRM_MARKER + ".", "",
-                          "Actions executed:", *executed, "", "Steps:", *self._step_lines(state), "",
+        note = "\n".join([AGENT_HEADER, "Action: completed the actions below"
+                          + (" (SIMULATED backends: no real change)" if simulated(kit.ctx.executed) else "")
+                          + "; sent the results to the caller; On Hold - Awaiting Caller.", CONFIRM_MARKER + ".", "",
+                          "Actions executed:", *executed_lines(kit.ctx.executed), "",
+                          "Steps:", *self._step_lines(state), "",
                           "Not resolved yet: it is resolved only if the caller confirms the fix worked; otherwise it",
                           "comes back to the Service Desk with the caller's reply."])
         self.desk.send_fix(incident, comment=comment, work_note=note, team=DEFAULT_TEAM)
         state["steps"].append({"tool": "complete_and_confirm", "detail": "results sent; On Hold - Awaiting Caller",
                                "simulated": False})
         return {"action": "awaiting_caller", "team": DEFAULT_TEAM, "priority": priority_number(incident.get("priority")),
+                "executed": [e["tool"] for e in kit.ctx.executed]}
+
+    def _resolve_verified(self, incident, state) -> dict:
+        """Every action that ran verified its own end state in the system: resolve now, invite a reply."""
+        kit = self.toolkit
+        comment, note, close_notes = verified_resolution(kit.ctx.caller_messages, kit.ctx.executed,
+                                                         self._step_lines(state))
+        self.desk.resolve(incident, comment=comment, work_note=note, close_notes=close_notes, team=DEFAULT_TEAM)
+        state["steps"].append({"tool": "complete_and_confirm", "detail": "fix verified in the system; resolved",
+                               "simulated": False})
+        return {"action": "resolved", "team": DEFAULT_TEAM, "priority": priority_number(incident.get("priority")),
                 "executed": [e["tool"] for e in kit.ctx.executed]}
 
     @staticmethod
@@ -498,6 +577,21 @@ class ServiceNowDesk:
         self.client.update("incident", incident["sys_id"], {
             "state": "6", "close_code": self.close_code, "close_notes": close_notes, "work_notes": work_note})
 
+    def resolve(self, incident, comment, work_note, close_notes, team=DEFAULT_TEAM, close_code=None):
+        """Resolved by the AI without a caller confirmation (verified fix, or no reply after reminders)."""
+        record = {"state": "6", "hold_reason": "", "close_code": close_code or self.close_code,
+                  "close_notes": close_notes,
+                  "comments": comment, "work_notes": work_note}
+        group = self._group(team)
+        if group:
+            record["assignment_group"] = group
+        self.client.update("incident", incident["sys_id"], record)
+
+    def remind(self, incident, comment, work_note):
+        # stays On Hold - Awaiting Caller; the service account's own comments never trigger the reply rule
+        self.client.update("incident", incident["sys_id"], {"state": "3", "hold_reason": "1",
+                                                            "comments": comment, "work_notes": work_note})
+
     def back_to_technician(self, incident, team, work_note, comment: str = ""):
         record = {"state": "2", "hold_reason": "", "work_notes": work_note}  # In Progress
         if comment:
@@ -543,6 +637,13 @@ class DryRunDesk:
 
     def confirm_resolved(self, incident, work_note, close_notes):
         self.actions.append({"action": "resolve", "work_note": work_note})
+
+    def resolve(self, incident, comment, work_note, close_notes, team=DEFAULT_TEAM, close_code=None):
+        self.actions.append({"action": "resolve", "comment": comment, "work_note": work_note,
+                             "close_notes": close_notes, "team": team, "close_code": close_code})
+
+    def remind(self, incident, comment, work_note):
+        self.actions.append({"action": "remind", "comment": comment, "work_note": work_note})
 
     def back_to_technician(self, incident, team, work_note, comment: str = ""):
         self.actions.append({"action": "back_to_technician", "team": team, "work_note": work_note, "comment": comment})
@@ -597,24 +698,12 @@ def classify_reply(llm, text: str) -> str:
     return match.group(1) if match else "unclear"
 
 
-def handle_caller_reply(llm, guardrail, desk, incident: dict, final_attempt: bool = True) -> dict:
-    """The caller answered our fix. Resolve only if THE CALLER confirms it worked; otherwise hand it back.
-    Acts at most once per incident: after the first reply is handled, people own the conversation."""
-    notes = str(incident.get("work_notes") or "")
-    state = str(incident.get("state") or "").lower()
-    if CONFIRM_MARKER not in notes:
-        return {"outcome": "not_agent_fix"}
-    if any(word in state for word in ("resolved", "closed", "canceled")) or state in ("6", "7", "8"):
-        return {"outcome": "not_waiting"}
-    if str(incident.get("assigned_to") or "").strip():
-        return {"outcome": "technician_assigned"}  # a person already owns it: stay out of the way
-    if "Caller reply at " in notes:
-        return {"outcome": "already_handled"}
+def _read_reply(llm, guardrail, incident: dict, final_attempt: bool):
+    """Newest caller comment -> (reply, verdict, quoted text for the note), or (None, ...) if none."""
     reply = latest_caller_reply(str(incident.get("comments") or ""))
     if not reply:
-        return {"outcome": "no_reply"}
+        return None, "", ""
     caller = str(incident.get("caller_id") or "").strip()
-    from_caller = bool(caller) and reply["author"] == caller
     try:
         guarded = guardrail.check_input(reply["text"])
         verdict = "unclear" if guarded.blocked or not reply["text"] else classify_reply(llm, guarded.text)
@@ -623,8 +712,42 @@ def handle_caller_reply(llm, guardrail, desk, incident: dict, final_attempt: boo
         if not final_attempt:
             raise AgentUnavailable(f"reply classification failed: {error}") from error
         verdict, quoted = "unclear", "(the AI could not read the reply)"
-    if not from_caller:
-        verdict = "not_caller"  # only the caller can confirm their own problem is fixed
+    if not (caller and reply["author"] == caller):
+        verdict = "not_caller"  # only the caller can confirm (or reopen) their own problem
+    return reply, verdict, quoted
+
+
+def _is_resolved(state: str) -> bool:
+    return any(word in state for word in ("resolved", "closed", "canceled")) or state in ("6", "7", "8")
+
+
+def ai_resolved(incident: dict) -> bool:
+    """Resolved (not closed) by the AI without a caller confirmation: a reply can still reopen it."""
+    state = str(incident.get("state") or "").lower()
+    return (state == "6" or "resolved" in state) and \
+        str(incident.get("close_notes") or "").startswith(RESOLVED_MARKER)
+
+
+def handle_caller_reply(llm, guardrail, desk, incident: dict, final_attempt: bool = True) -> dict:
+    """The caller answered. On a fix waiting for them: resolve only if THE CALLER confirms it worked,
+    otherwise hand it back. On a ticket the AI resolved without them (verified fix or no reply): reopen
+    it for a technician unless they say it's fixed. Acts at most once per incident: after a reply is
+    handled, people own the conversation."""
+    notes = str(incident.get("work_notes") or "")
+    state = str(incident.get("state") or "").lower()
+    if ai_resolved(incident):
+        return _reply_after_ai_resolution(llm, guardrail, desk, incident, final_attempt)
+    if CONFIRM_MARKER not in notes:
+        return {"outcome": "not_agent_fix"}
+    if _is_resolved(state):
+        return {"outcome": "not_waiting"}
+    if str(incident.get("assigned_to") or "").strip():
+        return {"outcome": "technician_assigned"}  # a person already owns it: stay out of the way
+    if "Caller reply at " in notes:
+        return {"outcome": "already_handled"}
+    reply, verdict, quoted = _read_reply(llm, guardrail, incident, final_attempt)
+    if not reply:
+        return {"outcome": "no_reply"}
     header = [AGENT_HEADER, f"Caller reply at {reply['at']} from {reply['author']}: {quoted}", ""]
     if verdict == "fixed":
         desk.confirm_resolved(incident, "\n".join(header + [
@@ -637,3 +760,22 @@ def handle_caller_reply(llm, guardrail, desk, incident: dict, final_attempt: boo
     desk.back_to_technician(incident, DEFAULT_TEAM, "\n".join(header + [
         reason, "Set back to In Progress for a technician. The fix that was tried is in the earlier AI note."]))
     return {"outcome": "back_to_technician", "verdict": verdict}
+
+
+def _reply_after_ai_resolution(llm, guardrail, desk, incident, final_attempt) -> dict:
+    """The caller wrote on a ticket the AI resolved. "It works, thanks" leaves it resolved (and writes
+    nothing, so a later "it broke again" can still reopen it); anything else reopens it for a technician."""
+    reply, verdict, quoted = _read_reply(llm, guardrail, incident, final_attempt)
+    if not reply:
+        return {"outcome": "no_reply"}
+    if verdict == "not_caller":
+        return {"outcome": "not_caller"}        # only the caller can reopen their own ticket
+    if verdict == "fixed":
+        return {"outcome": "still_resolved"}
+    desk.back_to_technician(incident, DEFAULT_TEAM, "\n".join([
+        AGENT_HEADER, f"Caller reply at {reply['at']} from {reply['author']}: {quoted}", "",
+        "The AI agent had resolved this incident without a caller confirmation; the caller's reply doesn't say "
+        "it's fixed, so it's reopened (In Progress) for a technician. The earlier AI notes show what was done."]),
+        comment=f"{AI_COMMENT_START}. Thanks for letting us know. We've reopened your ticket and a technician "
+                "will follow up.")
+    return {"outcome": "reopened", "verdict": verdict}

@@ -16,6 +16,8 @@ POST /servicenow/events  {"sys_id": "...", "number": "INC0010001"}  called by a 
 SQS worker               SN_MODE=agent (default): the ticket agent sends a verified fix and waits for the
                          caller, or escalates; on caller_reply it resolves only if the caller confirms.
                          SN_MODE=suggest: posts a suggested-answer work note only.
+Scheduled follow-up      servicenow_followups (hourly): tickets waiting on a silent caller get a reminder
+                         after 1 day and 2 days, and are resolved on day 3 (followup.py).
 """
 import base64
 import hashlib
@@ -277,6 +279,11 @@ def _enterprise_on() -> bool:
     return os.environ.get("SN_ENTERPRISE", "false") == "true"
 
 
+def _resolve_simulated() -> bool:
+    """Test switch: let fixes verified only in the simulated directory resolve real ServiceNow tickets."""
+    return os.environ.get("SN_RESOLVE_SIMULATED", "false") == "true"
+
+
 def _desk(client: ServiceNowClient) -> ServiceNowDesk:
     if "desk" not in _cache or _cache["desk"].client is not client:
         _cache["desk"] = ServiceNowDesk(client, close_code=os.environ.get("SN_CLOSE_CODE", "Solution provided"))
@@ -304,7 +311,8 @@ def work_incident(client, assistant, sys_id: str, kind: str = "new", time_left=N
         if decision not in ("approved", "rejected") or current != decision or not _enterprise_on():
             return {"sys_id": sys_id, "number": number, "kind": kind, "outcome": "ignored"}
         return {"sys_id": sys_id, "number": number, "kind": kind,
-                **handle_approval_decision(desk, incident, approver, decision == "approved", _enterprise_store())}
+                **handle_approval_decision(desk, incident, approver, decision == "approved", _enterprise_store(),
+                                           resolve_simulated=_resolve_simulated())}
     if kind == "caller_reply":
         try:
             handled = handle_caller_reply(assistant.llm, assistant.guardrail, desk, incident, final_attempt)
@@ -324,7 +332,7 @@ def work_incident(client, assistant, sys_id: str, kind: str = "new", time_left=N
         from enterprise.runtime import build_toolkit, caller_id
         toolkit = build_toolkit(str(number), caller_id(incident), store=_enterprise_store())
     try:
-        agent = TicketAgent(assistant.llm, assistant, desk, toolkit=toolkit)
+        agent = TicketAgent(assistant.llm, assistant, desk, toolkit=toolkit, resolve_simulated=_resolve_simulated())
         outcome = agent.run(incident, question, time_left=time_left, raise_on_model_error=not final_attempt)
     except AgentUnavailable as error:
         raise RetryLater(f"agent unavailable on {number}: {error}") from error
@@ -368,6 +376,42 @@ def servicenow_worker(event, context):
             logger.exception("Unexpected error on %s (attempt %s)", sys_id, receives)
             failures.append({"itemIdentifier": record["messageId"]})
     return {"batchItemFailures": failures}
+
+
+def servicenow_followups(event, context):
+    """Scheduled (hourly): remind callers who haven't answered, and resolve after two reminders.
+    A manual run can pass {"minutes": N} to treat tickets idle for N minutes as due (for testing)."""
+    from followup import FOLLOWUP_HOURS, NO_RESPONSE_CLOSE_CODE, run_followups
+    if os.environ.get("SN_MODE", "agent") != "agent":
+        return {"skipped": "suggest mode never contacts callers"}
+    try:
+        wait_hours = max(1, int(os.environ.get("SN_FOLLOWUP_HOURS", FOLLOWUP_HOURS)))
+    except ValueError:
+        wait_hours = FOLLOWUP_HOURS
+    minutes = wait_hours * 60
+    if isinstance(event, dict) and "minutes" in event:   # only a direct (IAM-authorized) invoke can set this
+        try:
+            minutes = max(0, int(event["minutes"]))
+        except (TypeError, ValueError):
+            return {"error": "'minutes' must be a whole number"}
+    time_left = (lambda: context.get_remaining_time_in_millis() / 1000 - 3) if context else None
+    try:
+        client = _servicenow()
+        results = run_followups(client, _desk(client), _enterprise_store(), os.environ.get("SN_USER", ""),
+                                minutes, wait_hours, time_left,
+                                close_code=os.environ.get("SN_NO_RESPONSE_CLOSE_CODE") or NO_RESPONSE_CLOSE_CODE)
+    except ServiceNowError as error:
+        if error.status == 401:  # password rotated: read it again next run
+            _cache.pop("servicenow", None)
+            _cache.pop("sn_password", None)
+        logger.warning("Follow-up run failed: %s", error)
+        return {"error": str(error)}
+    for result in results:
+        logger.info(json.dumps({"event": "servicenow_followup", **result}))
+    counts = {}
+    for result in results:
+        counts[result["outcome"]] = counts.get(result["outcome"], 0) + 1
+    return {"checked": len(results), "outcomes": counts, "results": results}
 
 
 # ---------------------------------------------------------------- public recruiter demo
@@ -458,8 +502,10 @@ def demo_ask(event, context):
                 # The 12 workflows against a fictional company: simulated tools only, state per request,
                 # a short model timeout so the page always answers in time.
                 from enterprise.runtime import demo_llm, demo_toolkit
+                # resolve_simulated: the demo writes nothing, so it can show "would resolve" for a verified fix
                 agent = TicketAgent(demo_llm(assistant.llm), assistant, DryRunDesk(), max_steps=8,
-                                    min_step_seconds=DEMO_ENTERPRISE_STEP_SECONDS, toolkit=demo_toolkit())
+                                    min_step_seconds=DEMO_ENTERPRISE_STEP_SECONDS, toolkit=demo_toolkit(),
+                                    resolve_simulated=True)
                 incident["caller_id"] = "Alex Rivera"
             else:
                 agent = TicketAgent(assistant.llm, assistant, DryRunDesk(), max_steps=3,

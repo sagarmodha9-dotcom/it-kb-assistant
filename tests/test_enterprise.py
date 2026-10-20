@@ -13,7 +13,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from agent import CONFIRM_MARKER, DryRunDesk, TicketAgent, handle_caller_reply  # noqa: E402
+from agent import (CONFIRM_MARKER, REOPEN_INVITE, RESOLVED_MARKER, SIMULATED_NOTICE, DryRunDesk,  # noqa: E402
+                   TicketAgent, handle_caller_reply)
 from enterprise.framework import (AuditLog, DynamoStore, MemoryStore,  # noqa: E402
                                   args_key, redact)
 from enterprise.loganalysis import analyze  # noqa: E402
@@ -156,9 +157,12 @@ def test_wf3_license_needs_manager_approval_then_runs_once():
     incident = {"sys_id": "a" * 32, "number": "INC0010100", "caller_id": "Alex Rivera", "caller_id.user_name": "alex.rivera"}
     assert handle_approval_decision(desk, incident, "alex.rivera", True, store)["outcome"] == "not_authorized"
     backends = SimBackends()
-    result = handle_approval_decision(desk, incident, "priya.shah", True, store, backends)
-    assert result["outcome"] == "executed_awaiting_caller" and "Visio_Plan2" in backends.data["users"]["alex.rivera"]["licenses"]
-    assert CONFIRM_MARKER in desk.actions[-1]["work_note"]
+    result = handle_approval_decision(desk, incident, "priya.shah", True, store, backends, resolve_simulated=True)
+    # a license is read back from the directory after it's assigned: verified, so resolved right away
+    # (only because this test opts in: by default simulated evidence never closes a ticket, see below)
+    assert result["outcome"] == "executed_resolved" and "Visio_Plan2" in backends.data["users"]["alex.rivera"]["licenses"]
+    assert desk.actions[-1]["action"] == "resolve" and desk.actions[-1]["close_notes"].startswith(RESOLVED_MARKER)
+    assert SIMULATED_NOTICE in desk.actions[-1]["comment"] and "SIMULATED" in desk.actions[-1]["close_notes"]
     assert handle_approval_decision(desk, incident, "priya.shah", True, store)["outcome"] == "no_pending_approval"
 
 
@@ -300,17 +304,60 @@ def test_wf11_offboarding():
 
 
 # ---------------------------------------------------------------- 12. follow-up and resolution verification
-def test_wf12_agent_unlocks_then_waits_for_caller_confirmation():
+def test_wf12_verified_unlock_resolves_right_away_and_a_reply_reopens_it():
     llm = Scripted(("get_account_status", {"user": "alex.rivera"}), ("unlock_account", {"user": "alex.rivera"}),
                    ("verify_caller_identity", {}), ("unlock_account", {"user": "alex.rivera"}),
                    ("complete_and_confirm", {}))
     desk = DryRunDesk()
-    agent = TicketAgent(llm, Assistant(NO_ANSWER), desk, toolkit=kit())
+    agent = TicketAgent(llm, Assistant(NO_ANSWER), desk, toolkit=kit(), resolve_simulated=True)
     incident = {"sys_id": "a" * 32, "number": "INC1", "short_description": "I'm locked out", "priority": "4 - Low"}
     out = agent.run(incident, "I'm locked out")
-    assert out["action"] == "awaiting_caller" and out["executed"] == ["unlock_account"]
+    assert out["action"] == "resolved" and out["executed"] == ["unlock_account"]
+    action = desk.actions[0]
+    assert action["action"] == "resolve" and action["close_notes"].startswith(RESOLVED_MARKER)
+    assert "unlocked" in action["comment"] and REOPEN_INVITE in action["comment"]
+    assert action["comment"].index(SIMULATED_NOTICE) < action["comment"].index("unlocked")   # said up front
+    assert "SIMULATED" in action["work_note"] and CONFIRM_MARKER not in action["work_note"]
+    resolved = {**incident, "state": "Resolved", "caller_id": "Alex Rivera", "work_notes": action["work_note"],
+                "close_notes": action["close_notes"]}
+
+    def said(text, who="Alex Rivera"):
+        return {**resolved, "comments": f"2026-10-19 10:05:00 - {who} (Additional comments)\n{text}\n\n"
+                                        f"2026-10-19 10:00:00 - KB Assistant (Additional comments)\n{action['comment']}"}
+    guard, follow = build_guardrail({}), DryRunDesk()
+    assert handle_caller_reply(FakeLLM(), guard, follow, said("Yes it works now, thanks"))["outcome"] == "still_resolved"
+    assert handle_caller_reply(FakeLLM(), guard, follow, said("Still broken", "Beth Tech"))["outcome"] == "not_caller"
+    assert follow.actions == []                                  # thanks / someone else: nothing written
+    result = handle_caller_reply(FakeLLM(), guard, follow, said("No, I still can't sign in"))
+    assert result["outcome"] == "reopened" and follow.actions[0]["action"] == "back_to_technician"
+    assert "reopened" in follow.actions[0]["comment"]
+
+
+def test_simulated_evidence_never_closes_a_ticket_by_default():
+    script = (("verify_caller_identity", {}), ("unlock_account", {}), ("complete_and_confirm", {}))
+    incident = {"sys_id": "a" * 32, "number": "INC1", "short_description": "locked out", "priority": "4 - Low"}
+    desk = DryRunDesk()
+    out = TicketAgent(Scripted(*script), Assistant(NO_ANSWER), desk, toolkit=kit()).run(incident, "x")
+    assert out["action"] == "awaiting_caller" and desk.actions[0]["action"] == "send_fix"
+    assert SIMULATED_NOTICE in desk.actions[0]["comment"] and CONFIRM_MARKER in desk.actions[0]["work_note"]
+    # a live (real tenant) tool with the same verification resolves without the switch
+    live = kit()
+    live.registry.tools["unlock_account"].simulated = False
+    desk = DryRunDesk()
+    out = TicketAgent(Scripted(*script), Assistant(NO_ANSWER), desk, toolkit=live).run(incident, "x")
+    assert out["action"] == "resolved" and SIMULATED_NOTICE not in desk.actions[0]["comment"]
+    assert "SIMULATED" not in desk.actions[0]["close_notes"]
+
+
+def test_wf12_unverifiable_action_still_waits_for_the_caller():
+    llm = Scripted(("get_devices", {}), ("sync_device", {"device_id": "LAP-0412"}), ("complete_and_confirm", {}))
+    desk = DryRunDesk()
+    incident = {"sys_id": "a" * 32, "number": "INC1", "short_description": "Laptop not getting settings",
+                "priority": "4 - Low"}
+    out = TicketAgent(llm, Assistant(NO_ANSWER), desk, toolkit=kit()).run(incident, "x")
+    assert out["action"] == "awaiting_caller" and desk.actions[0]["action"] == "send_fix"
     note, comment = desk.actions[0]["work_note"], desk.actions[0]["comment"]
-    assert "unlocked" in comment and CONFIRM_MARKER in note and "SIMULATED" in note
+    assert CONFIRM_MARKER in note and SIMULATED_NOTICE in comment and "SIMULATED backends" in note
     journal = (f"2026-10-19 10:05:00 - Alex Rivera (Additional comments)\nYes it works now, thanks\n\n"
                f"2026-10-19 10:00:00 - KB Assistant (Additional comments)\n{comment}")
     follow = DryRunDesk()
@@ -318,6 +365,14 @@ def test_wf12_agent_unlocks_then_waits_for_caller_confirmation():
                                  {**incident, "state": "On Hold", "caller_id": "Alex Rivera", "work_notes": note,
                                   "comments": journal})
     assert result["outcome"] == "resolved" and follow.actions[0]["action"] == "resolve"
+
+
+def test_urgent_incidents_are_never_resolved_without_the_caller():
+    llm = Scripted(("verify_caller_identity", {}), ("unlock_account", {}), ("complete_and_confirm", {}))
+    desk = DryRunDesk()
+    out = TicketAgent(llm, Assistant(NO_ANSWER), desk, toolkit=kit()).run(
+        {"sys_id": "a" * 32, "number": "INC1", "short_description": "locked out", "priority": "2 - High"}, "x")
+    assert out["action"] == "awaiting_caller" and desk.actions[0]["action"] == "send_fix"
 
 
 def test_wf12_finish_tools_are_gated():
@@ -375,14 +430,16 @@ def test_worker_enterprise_mode_and_approval_event(monkeypatch):
     # the approver (group owner) approves in ServiceNow -> approval event -> action runs, caller asked to confirm
     sn.inc.update(approval="Approved", work_notes=sn.updates[-1]["work_notes"])
     # the requester's own "approval" is refused; the decision comes signed from the Business Rule
+    monkeypatch.setenv("SN_RESOLVE_SIMULATED", "true")   # dev-instance switch: resolve on simulated evidence
     msg = {"sys_id": "a" * 32, "event": "approval", "decision": "approved", "approver": "taylor.kim"}
     assert app.work_incident(sn, assistant, "a" * 32, "approval", event=msg)["outcome"] == "not_authorized"
     stale = {**msg, "approver": "sam.ortiz", "decision": "rejected"}            # no longer what the incident shows
     assert app.work_incident(sn, assistant, "a" * 32, "approval", event=stale)["outcome"] == "ignored"
     out = app.servicenow_worker({"Records": [{"messageId": "m1", "body": json.dumps({**msg, "approver": "sam.ortiz"}),
                                               "attributes": {"ApproximateReceiveCount": "1"}}]}, None)
-    assert out == {"batchItemFailures": []} and sn.updates[-1]["state"] == "3"
-    assert "added to Finance-Reports" in sn.updates[-1]["comments"]
+    # group membership is read back after the change: verified, so the incident is resolved (Taylor can reopen)
+    assert out == {"batchItemFailures": []} and sn.updates[-1]["state"] == "6"
+    assert "added to Finance-Reports" in sn.updates[-1]["comments"] and SIMULATED_NOTICE in sn.updates[-1]["comments"]
     app._cache.clear()
 
 
@@ -419,7 +476,7 @@ def test_public_demo_runs_simulated_workflow_trace(monkeypatch):
     out = app.demo_ask({"headers": {"x-api-key": "k", "x-demo-client": "1.2.3.4"},
                         "body": json.dumps({"question": "I'm locked out of my account"})}, None)
     plan = json.loads(out["body"])["agent"]
-    assert plan["action"] == "awaiting_caller" and plan["dry_run"]
+    assert plan["action"] == "resolved" and plan["dry_run"]
     tools = [(s["tool"], s["simulated"]) for s in plan["steps"]]
     assert ("unlock_account", True) in tools and ("search_knowledge_base", False) in tools
     assert "secret" not in out["body"].lower() and "temporary password" not in out["body"]
